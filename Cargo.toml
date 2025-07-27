@@ -1,0 +1,16 @@
+[package]
+name = "aa_player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio-util = { version = "0.7.15" }
+tokio = { version = "1", features = ["full"] }
+nusb = "0.1.14"
+futures = "0.3.31"
+byteorder = "1.5.0"
+rustls = "=0.23.27"
+rustls-webpki ="=0.103.2"
+
+[patch.crates-io]
+rustls-webpki = {git = "https://github.com/uglyoldbob/webpki.git"}
