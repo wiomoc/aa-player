@@ -6,6 +6,7 @@ use std::{
 };
 
 use futures::stream::StreamExt;
+use log::{error, info, trace, warn};
 use nusb::{
     DeviceId, DeviceInfo, Interface,
     hotplug::HotplugEvent,
@@ -69,7 +70,10 @@ impl UsbManager {
         usb_manager
     }
 
-    pub async fn send_frame(&self, frame: AAPFrame) -> Result<(), mpsc::error::SendError<AAPFrame>> {
+    pub async fn send_frame(
+        &self,
+        frame: AAPFrame,
+    ) -> Result<(), mpsc::error::SendError<AAPFrame>> {
         self.outgoing_queue_sender.send(frame).await
     }
 
@@ -138,7 +142,10 @@ impl UsbInternalState {
         if vid == Self::AOA_VID && (pid == Self::AOA_PID_V1 || pid == Self::AOA_PID_V2) {
             self.handle_connected_aoa_device(device_info).await;
         } else {
-            Self::switch_device_to_aoa_mode(device_info).await;
+            let res = Self::switch_device_to_aoa_mode(device_info).await;
+            if let Err(err) = res {
+                warn!("switching device to aoa failed {:?}", err);
+            }
         }
     }
 
@@ -146,12 +153,12 @@ impl UsbInternalState {
         &mut self,
         device_info: DeviceInfo,
     ) -> Result<(), nusb::Error> {
-        println!("AOA: {:?}", device_info);
+        info!("handle connected aoa device {:?}", device_info);
 
         let device = match device_info.open() {
             Ok(device) => device,
             Err(err) => {
-                eprintln!(
+                error!(
                     "could not open {}:{} - {:?}",
                     device_info.vendor_id(),
                     device_info.product_id(),
@@ -198,20 +205,11 @@ impl UsbInternalState {
             //    device.set_configuration(config_num).unwrap();
             //}
             time::sleep(Duration::from_millis(300)).await;
-            println!(
-                "{} {} {} {} {} {}",
-                config_num,
-                device.active_configuration().unwrap().configuration_value(),
-                interface_num,
-                in_endpoint_address,
-                out_endpoint_address,
-                max_packet_size,
-            );
 
             let interface = match device.claim_interface(interface_num) {
                 Ok(interface) => interface,
                 Err(err) => {
-                    eprintln!("could not claim {}", interface_num);
+                    error!("could not claim {}", interface_num);
                     return Err(err);
                 }
             };
@@ -251,7 +249,7 @@ impl UsbInternalState {
     }
 
     async fn handle_disconnected_device(&mut self, device_id: DeviceId) {
-        println!("Disconnected: {:?}", device_id);
+        info!("disconnected device {:?}", device_id);
         if let Some(device_state) = self
             .connected_device
             .take_if(|device_state| device_state.connected_device_id == device_id)
@@ -267,7 +265,6 @@ impl UsbInternalState {
         packet_size: usize,
         terminate_connection_token: CancellationToken,
     ) {
-        println!("starting rx loop");
         incoming_queue.send(IncomingEvent::Connected).await.unwrap();
         let mut reader = UsbReader::new(
             interface,
@@ -278,9 +275,9 @@ impl UsbInternalState {
         let mut codec = AAPFrameCodec::new();
         loop {
             let result = codec.read_frame(&mut reader).await;
-            println!("{:?}", &result);
             match result {
-                Err(_err) => {
+                Err(err) => {
+                    error!("receiving frame failed {:?}", err);
                     terminate_connection_token.cancel();
                     incoming_queue.send(IncomingEvent::Closed).await.unwrap();
                     return;
@@ -302,8 +299,6 @@ impl UsbInternalState {
         packet_size: usize,
         terminate_connection_token: CancellationToken,
     ) {
-        println!("starting tx loop");
-
         let mut writer = UsbWriter::new(
             interface,
             endpoint,
@@ -319,11 +314,10 @@ impl UsbInternalState {
                 frame = outgoing_queue.recv() => frame
             };
             if let Some(frame) = frame {
-                println!("out frame {:?}", &frame);
                 let result = codec.write_frame(frame, &mut writer).await;
 
                 if let Err(err) = result {
-                    eprintln!("Sending failed {:?}", err);
+                    error!("sending frame failed {:?}", err);
                     terminate_connection_token.cancel();
                     break;
                 }
@@ -335,11 +329,11 @@ impl UsbInternalState {
     }
 
     async fn switch_device_to_aoa_mode(device_info: DeviceInfo) -> Result<(), nusb::Error> {
-        println!("switching {:?}", device_info.id());
+        info!("switching usb device {:?} to aoa mode", device_info.id());
         let device = match device_info.open() {
             Ok(device) => device,
             Err(err) => {
-                eprintln!(
+                warn!(
                     "could not open {}:{} - {:?}",
                     device_info.vendor_id(),
                     device_info.product_id(),
@@ -352,7 +346,7 @@ impl UsbInternalState {
         let interface = match device.claim_interface(0) {
             Ok(interface) => interface,
             Err(err) => {
-                eprintln!("could not claim {:?}", err);
+                warn!("could not claim {:?}", err);
                 return Err(err);
             }
         };
@@ -399,7 +393,7 @@ impl UsbInternalState {
         send_string(4, "").await?;
         send_string(5, "").await?;
 
-        let response = send_control_out(ControlOut {
+        send_control_out(ControlOut {
             control_type: ControlType::Vendor,
             recipient: Recipient::Device,
             request: 53,
@@ -407,9 +401,9 @@ impl UsbInternalState {
             index: 0,
             data: &[],
         })
-        .await;
+        .await?;
 
-        println!("{:?}", response);
+        info!("switching to aoa mode done");
 
         Ok(())
     }
@@ -446,7 +440,6 @@ impl UsbReader {
         assert!(self.buffer.as_ref().unwrap().len() == self.buffer_offset);
         loop {
             let buf = RequestBuffer::reuse(self.buffer.take().unwrap(), self.packet_size);
-            println!("pre req {}", self.packet_size);
 
             let transfer_completion = select! {
                 _ = self.terminate_connection_token.cancelled() => { return Err(Error::from(ErrorKind::UnexpectedEof)); }
@@ -455,7 +448,6 @@ impl UsbReader {
 
             let response = transfer_completion.into_result();
 
-            println!("status {:?}", response.as_ref().err());
             match response {
                 Ok(packet) => {
                     if packet.len() == 0 {
@@ -464,6 +456,7 @@ impl UsbReader {
                             _ = time::sleep(Duration::from_millis(2)) => {}
                         };
                     } else {
+                        trace!("usb < {:?}", &packet);
                         self.buffer = Some(packet);
                         self.buffer_offset = 0;
                         return Ok(());
@@ -480,7 +473,6 @@ impl UsbReader {
 impl AsyncReader for UsbReader {
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), std::io::Error> {
         let mut buf = &mut buf[..];
-        println!("{}", buf.len());
         loop {
             let read_buffer = self.buffer.as_ref().unwrap();
             let read_buffer = &read_buffer[self.buffer_offset..];
@@ -529,14 +521,12 @@ impl UsbWriter {
 
     async fn flush_buffer(&mut self) -> Result<(), std::io::Error> {
         let buffer = self.buffer.take().unwrap();
-        println!("> {:?}", &buffer);
+        trace!("usb > {:?}", &buffer);
 
         let buffer = select! {
             response  = self.interface.bulk_out(self.endpoint, buffer) => response.into_result()?,
             _ = self.terminate_connection_token.cancelled() => {return Err(Error::from(ErrorKind::UnexpectedEof));}
         };
-
-        println!("post send");
 
         self.buffer = Some(buffer.reuse());
         Ok(())

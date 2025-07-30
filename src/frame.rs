@@ -71,8 +71,6 @@ impl<R: AsyncReader> FrameDecoder<R> for AAPFrameCodec {
         let channel_id = header[0];
         let flags = header[1];
 
-        println!("channel id {} flags {} {:?}", channel_id, flags, &header);
-
         let frag_info = match flags & AAPFrameCodec::FRAGMENTATION_MASK {
             0 => AAPFrameFragmmentation::Continuation,
             1 => AAPFrameFragmmentation::First,

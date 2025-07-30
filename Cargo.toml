@@ -11,6 +11,12 @@ futures = "0.3.31"
 byteorder = "1.5.0"
 rustls = "=0.23.27"
 rustls-webpki ="=0.103.2"
+log = "0.4.27"
+simple_logger = "5.0.0"
+prost = "0.14.1"
 
 [patch.crates-io]
 rustls-webpki = {git = "https://github.com/uglyoldbob/webpki.git"}
+
+[build-dependencies]
+prost-build = "0.14.1"
