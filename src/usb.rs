@@ -43,7 +43,7 @@ struct UsbInternalState {
 pub(crate) enum IncomingEvent {
     Connected,
     Closed,
-    Message(AAPFrame),
+    Frame(AAPFrame),
 }
 
 //impl<C: FrameDecoder<UsbReader> + FrameEncoder<UsbWriter>> UsbManager {
@@ -284,7 +284,7 @@ impl UsbInternalState {
                 }
                 Ok(frame) => {
                     incoming_queue
-                        .send(IncomingEvent::Message(frame))
+                        .send(IncomingEvent::Frame(frame))
                         .await
                         .unwrap();
                 }

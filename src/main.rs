@@ -39,7 +39,7 @@ async fn main() -> Result<(), ()> {
         tokio::signal::ctrl_c().await.unwrap();
         drop(outgoing_packet_queue_sender);
     });
-    PacketFramer::start_processing(usb_manager, outgoing_packet_queue_receiver).await;
+    PacketRouter::start_processing(usb_manager, outgoing_packet_queue_receiver).await;
     Ok(())
 }
 
@@ -84,29 +84,31 @@ impl Packet {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
 enum PacketFramerConnectionState {
     WaitVersionResponse,
     Handshaking,
-    Established,
+    Established { heartbeat: Heartbeater },
 }
 
-struct PacketFramerStateConnected {
-    encrypted_connection_manager: EncryptedConnectionManager,
-    pending_frame: Option<AAPFrame>,
+struct PacketRouterStateConnected {
+    framer: PacketFramer,
     connection_state: PacketFramerConnectionState,
 }
 
-enum PacketFramerState {
+enum PacketRouterState {
     NotConnected,
-    Connected(PacketFramerStateConnected),
+    Connected(PacketRouterStateConnected),
+}
+
+struct PacketRouter {
+    usb_manager: UsbManager,
+    state: PacketRouterState,
+    encryption_manager: EncryptionManager,
 }
 
 struct PacketFramer {
-    usb_manager: UsbManager,
-    encryption_manager: EncryptionManager,
-    state: PacketFramerState,
-    heartbeat: Option<Heartbeater>,
+    pending_frame: Option<AAPFrame>,
+    encrypted_connection_manager: EncryptedConnectionManager,
 }
 
 enum HeartbeatState {
@@ -120,8 +122,7 @@ struct Heartbeater {
     next_timeout: Instant,
 }
 
-impl PacketFramer {
-    const MAX_FRAME_PAYLOAD_LENGTH: usize = 0x4000;
+impl PacketRouter {
     const PING_INTERVAL_MS: u64 = 4000;
     const PING_MAX_RTT_MS: u64 = 800;
 
@@ -129,52 +130,92 @@ impl PacketFramer {
         usb_manager: UsbManager,
         mut outgoing_packet_queue: Receiver<Packet>,
     ) {
-        let mut packet_framer = PacketFramer {
+        let mut packet_framer = PacketRouter {
             encryption_manager: EncryptionManager::new(),
             usb_manager,
-            state: PacketFramerState::NotConnected,
-            heartbeat: None,
+            state: PacketRouterState::NotConnected,
         };
 
+        loop {
+            let incoming_event = packet_framer.usb_manager.recv_frame().await;
+            packet_framer.process_incoming_event(incoming_event).await;
+            if matches!(incoming_event, usb::IncomingEvent::Connected) {
+                packet_framer.process_connected_event().await;
+            }
+        }
+        packet_framer.usb_manager.terminate();
+    }
+
+    async fn process_incoming_event(&mut self, incoming_event: IncomingEvent) {
+        match incoming_event {
+            usb::IncomingEvent::Connected => {}
+            usb::IncomingEvent::Closed => {
+                self.state = PacketRouterState::NotConnected;
+                info!("closed")
+            }
+            usb::IncomingEvent::Frame(aap_frame) => self.process_incoming_frame(aap_frame).await,
+        }
+    }
+
+    async fn process_connected_event(&mut self) {
+        assert!(matches!(self.state, PacketRouterState::NotConnected));
+        let connected_state = PacketRouterStateConnected {
+            connection_state: PacketFramerConnectionState::WaitVersionResponse,
+            framer: PacketFramer::new(self.encryption_manager.new_connection()),
+        };
+
+        self.state = PacketRouterState::Connected(connected_state);
+        self.send_packet(build_version_request_packet()).await;
+    }
+}
+impl PacketRouterStateConnected {
+    async fn start(
+        &mut self,
+        outgoing_packet_queue: &mut Receiver<Packet>,
+        usb_manager: &mut UsbManager,
+    ) {
         loop {
             select! {
                 outgoing_packet = outgoing_packet_queue.recv() => {
                     if let Some(outgoing_packet) = outgoing_packet {
-                        packet_framer.process_outgoing_packet(outgoing_packet).await
+                        self.send_packet(outgoing_packet).await
                     } else {
                         break;
                     }
                 },
-                incoming_event = packet_framer.usb_manager.recv_frame() => packet_framer.process_incoming_event(incoming_event).await,
+                incoming_event = usb_manager.recv_frame() => match incoming_event {
+                    IncomingEvent::Connected => todo!(),
+                    IncomingEvent::Closed => return ,
+                    IncomingEvent::Frame(frame) => self.process_incoming_frame(frame).await,
+                },
                 _ = Self::wait_for_timeout(&packet_framer.heartbeat), if packet_framer.heartbeat.is_some() => packet_framer.handle_heartbeat_timer().await,
             }
         }
-        packet_framer.usb_manager.terminate();
+    }
+    async fn process_incoming_frame(&mut self, frame: AAPFrame) {
+        let packet = self.framer.process_incoming_frame(frame);
+        if let Some(packet) = packet {
+            self.dispatch_incoming_packet(packet).await;
+        }
     }
 
     async fn wait_for_timeout(heartbeat: &Option<Heartbeater>) {
         time::sleep_until(heartbeat.as_ref().unwrap().next_timeout).await
     }
 
-
     async fn handle_heartbeat_timer(&mut self) {
-        if let PacketFramerState::Connected(PacketFramerStateConnected {
-            connection_state, ..
-        }) = &self.state
-        {
-            assert!(matches!(
-                connection_state,
-                PacketFramerConnectionState::Established
-            ));
-        } else {
-            panic!();
-        }
-
         let Heartbeater {
             next_timeout,
             state,
             counter,
-        } = self.heartbeat.as_mut().unwrap();
+        } = if let PacketFramerConnectionState::Established { heartbeat } =
+            &mut self.connection_state
+        {
+            heartbeat
+        } else {
+            panic!();
+        };
+
         let ping_packet = match state {
             HeartbeatState::WaitingUntilSendingNextPingRequest => {
                 let ping_packet = build_ping_request_packet(counter.to_be_bytes().to_vec());
@@ -190,38 +231,35 @@ impl PacketFramer {
                 return;
             }
         };
-        self.process_outgoing_packet(ping_packet).await;
+        self.send_packet(ping_packet).await;
     }
 
     fn restart_heartbeat_timer(&mut self) {
-        if let Some(Heartbeater {
-            next_timeout,
-            state,
-            ..
-        }) = self.heartbeat.as_mut()
-        {
-            match state {
+        if let PacketFramerConnectionState::Established { heartbeat } = &mut self.connection_state {
+            match heartbeat.state {
                 HeartbeatState::WaitingUntilSendingNextPingRequest => {
-                    *state = HeartbeatState::WaitingUntilSendingNextPingRequest;
-                    *next_timeout = Self::next_ping_request_instant()
+                    heartbeat.state = HeartbeatState::WaitingUntilSendingNextPingRequest;
+                    heartbeat.next_timeout = Self::next_ping_request_instant()
                 }
                 HeartbeatState::WaitingForPingResponse => {}
             };
         } else {
-            self.heartbeat = Some(Heartbeater {
-                state: HeartbeatState::WaitingUntilSendingNextPingRequest,
-                counter: 0,
-                next_timeout: Self::next_ping_request_instant(),
-            })
+            panic!();
         }
     }
 
+    fn start_heartbeat_timer() -> Heartbeater { 
+Heartbeater {
+                state: HeartbeatState::WaitingUntilSendingNextPingRequest,
+                counter: 0,
+                next_timeout: Self::next_ping_request_instant(),
+            }
+    }
+
+
     fn handle_heartbeat_ping_response(&mut self, packet: Packet) {
         let ping_response = protos::PingResponse::decode(packet.payload()).unwrap();
-        info!(
-            "ping response received: {:?}",
-            &ping_response
-        );
+        info!("ping response received: {:?}", &ping_response);
 
         let Heartbeater {
             next_timeout,
@@ -233,7 +271,7 @@ impl PacketFramer {
                 let data = ping_response.data();
                 assert!(data.len() == 4);
                 let received_counter_value = BigEndian::read_u32(data);
-                if(received_counter_value != *counter) {
+                if (received_counter_value != *counter) {
                     info!("Ignoring unsolicited ping response");
                     return;
                 }
@@ -251,126 +289,39 @@ impl PacketFramer {
             .unwrap()
     }
 
-    async fn process_outgoing_packet(&mut self, packet: Packet) {
-        let connected_state = if let PacketFramerState::Connected(connected_state) = &mut self.state
-        {
-            connected_state
-        } else {
-            panic!("Not connected");
-        };
-        debug!("> {:?}", &packet);
-
-        if packet.message_id_and_payload.len() <= Self::MAX_FRAME_PAYLOAD_LENGTH {
-            let may_be_encrypted_payload = if packet.encrypted {
-                assert!(matches!(
-                    connected_state.connection_state,
-                    PacketFramerConnectionState::Established
-                ));
-                connected_state
-                    .encrypted_connection_manager
-                    .encrypt_message(&packet.message_id_and_payload)
-            } else {
-                packet.message_id_and_payload
-            };
-
-            self.usb_manager
-                .send_frame(AAPFrame {
-                    channel_id: packet.channel_id,
-                    encrypted: packet.encrypted,
-                    frag_info: frame::AAPFrameFragmmentation::Unfragmented,
-                    r#type: packet.r#type,
-                    total_payload_length: may_be_encrypted_payload.len(),
-                    payload: may_be_encrypted_payload,
-                })
-                .await
-                .unwrap();
-        } else {
-            let total_payload_length = packet.message_id_and_payload.len();
-            let payload_fragments_count = (total_payload_length + Self::MAX_FRAME_PAYLOAD_LENGTH
-                - 1)
-                / Self::MAX_FRAME_PAYLOAD_LENGTH;
-            for (index, fragment) in packet
-                .message_id_and_payload
-                .chunks(Self::MAX_FRAME_PAYLOAD_LENGTH)
-                .enumerate()
-            {
-                let may_be_encrypted_fragment_payload = if packet.encrypted {
-                    assert!(matches!(
-                        connected_state.connection_state,
-                        PacketFramerConnectionState::Established
-                    ));
-                    connected_state
-                        .encrypted_connection_manager
-                        .encrypt_message(fragment)
-                } else {
-                    fragment.to_vec()
-                };
-
-                let frag_info = match index {
-                    0 => frame::AAPFrameFragmmentation::First,
-                    _ if index == payload_fragments_count - 1 => {
-                        frame::AAPFrameFragmmentation::Last
-                    }
-                    _ => frame::AAPFrameFragmmentation::Continuation,
-                };
-                self.usb_manager
-                    .send_frame(AAPFrame {
-                        channel_id: packet.channel_id,
-                        encrypted: packet.encrypted,
-                        frag_info,
-                        r#type: packet.r#type,
-                        total_payload_length,
-                        // XXX could be incorrect if payload expands during encryption
-                        payload: may_be_encrypted_fragment_payload,
-                    })
-                    .await
-                    .unwrap();
-            }
-        }
-    }
-
     async fn dispatch_incoming_packet(&mut self, mut packet: Packet) {
-        // todo clean up
-        let connected_state = if let PacketFramerState::Connected(connected_state) = &mut self.state
-        {
-            connected_state
-        } else {
-            panic!("Not connected");
-        };
-
         debug!("< {:?}", &packet);
-        match connected_state.connection_state {
+        match self.connection_state {
             PacketFramerConnectionState::WaitVersionResponse => {
                 assert!(packet.channel_id == CHANNEL_ID_CONTROL);
                 assert!(packet.message_id() == MESSAGE_ID_GET_VERSION_RESPONSE);
-                connected_state.connection_state = PacketFramerConnectionState::Handshaking;
-                let handshake_message = connected_state
-                    .encrypted_connection_manager
+                self.connection_state = PacketFramerConnectionState::Handshaking;
+                let handshake_message = self
+                    .framer
                     .process_handshake_message(&mut [])
                     .unwrap();
-                self.process_outgoing_packet(build_handshake_packet(&handshake_message))
+                self.send_packet(build_handshake_packet(&handshake_message))
                     .await;
             }
             PacketFramerConnectionState::Handshaking => {
                 assert!(packet.channel_id == CHANNEL_ID_CONTROL);
                 assert!(packet.message_id() == MESSAGE_ID_HANDSHAKE);
-                if let Some(handshake_message) = connected_state
-                    .encrypted_connection_manager
+                if let Some(handshake_message) = self
+                    .framer
                     .process_handshake_message(packet.payload_mut())
                 {
-                    self.process_outgoing_packet(build_handshake_packet(&handshake_message))
+                    self.send_packet(build_handshake_packet(&handshake_message))
                         .await;
-                } else if !connected_state
-                    .encrypted_connection_manager
+                } else if !self.framer
                     .is_handshaking()
                 {
-                    connected_state.connection_state = PacketFramerConnectionState::Established;
+                    let heartbeat = Heartbeater { state: (), counter: (), next_timeout: () }
+                    self.connection_state = PacketFramerConnectionState::Established { heartbeat};
                     info!("handshaking done");
-                    self.process_outgoing_packet(build_auth_complete_packet())
-                        .await;
+                    self.send_packet(build_auth_complete_packet()).await;
                 }
             }
-            PacketFramerConnectionState::Established => {
+            PacketFramerConnectionState::Established{..} => {
                 info!("received normal packet");
 
                 self.restart_heartbeat_timer();
@@ -528,7 +479,7 @@ impl PacketFramer {
                         ..Default::default()
                     };
 
-                    self.process_outgoing_packet(build_service_discovery_response_packet(
+                    self.send_packet(build_service_discovery_response_packet(
                         service_discovery_response,
                     ))
                     .await;
@@ -545,82 +496,146 @@ impl PacketFramer {
         }
     }
 
-    async fn process_incoming_event(&mut self, incoming_event: IncomingEvent) {
-        match incoming_event {
-            usb::IncomingEvent::Connected => {
-                self.process_connected_event().await;
-            }
-            usb::IncomingEvent::Closed => {
-                self.state = PacketFramerState::NotConnected;
-                info!("closed")
-            }
-            usb::IncomingEvent::Message(aap_frame) => self.process_incoming_frame(aap_frame).await,
-        }
-    }
-
-    async fn process_connected_event(&mut self) {
-        assert!(matches!(self.state, PacketFramerState::NotConnected));
-        let encrypted_connection_manager = self.encryption_manager.new_connection();
-        let connected_state = PacketFramerStateConnected {
-            encrypted_connection_manager,
-            pending_frame: None,
-            connection_state: PacketFramerConnectionState::WaitVersionResponse,
-        };
-
-        self.state = PacketFramerState::Connected(connected_state);
-        self.process_outgoing_packet(build_version_request_packet())
-            .await;
-    }
-
-    async fn process_incoming_frame(&mut self, frame: AAPFrame) {
-        let connected_state = if let PacketFramerState::Connected(connected_state) = &mut self.state
+    async fn send_packet(&mut self, packet: Packet) {
+        let connected_state = if let PacketRouterState::Connected(connected_state) = &mut self.state
         {
             connected_state
         } else {
             panic!("Not connected");
         };
+
+        connected_state
+            .framer
+            .process_outgoing_packet(packet, async |frame| {
+                self.usb_manager.send_frame(frame).await.unwrap()
+            })
+            .await;
+    }
+}
+
+impl PacketFramer {
+    const MAX_FRAME_PAYLOAD_LENGTH: usize = 0x4000;
+
+    fn new(encrypted_connection_manager: EncryptedConnectionManager) -> Self {
+        Self {
+            pending_frame: None,
+            encrypted_connection_manager,
+        }
+    }
+
+    pub(crate) fn process_handshake_message(&mut self, payload: &mut [u8]) -> Option<Vec<u8>> {
+        self.encrypted_connection_manager.process_handshake_message(payload)
+    }
+
+    pub(crate) fn is_handshaking(&self) -> bool {
+        self.encrypted_connection_manager.is_handshaking()
+    }
+
+    async fn process_outgoing_packet(
+        &mut self,
+        packet: Packet,
+        frame_sender: impl AsyncFn(AAPFrame),
+    ) {
+        debug!("> {:?}", &packet);
+
+        if packet.message_id_and_payload.len() <= Self::MAX_FRAME_PAYLOAD_LENGTH {
+            let may_be_encrypted_payload = if packet.encrypted {
+                assert!(!self.encrypted_connection_manager.is_handshaking());
+                self.encrypted_connection_manager
+                    .encrypt_message(&packet.message_id_and_payload)
+            } else {
+                packet.message_id_and_payload
+            };
+
+            frame_sender(AAPFrame {
+                channel_id: packet.channel_id,
+                encrypted: packet.encrypted,
+                frag_info: frame::AAPFrameFragmmentation::Unfragmented,
+                r#type: packet.r#type,
+                total_payload_length: may_be_encrypted_payload.len(),
+                payload: may_be_encrypted_payload,
+            })
+            .await
+        } else {
+            let total_payload_length = packet.message_id_and_payload.len();
+            let payload_fragments_count = (total_payload_length + Self::MAX_FRAME_PAYLOAD_LENGTH
+                - 1)
+                / Self::MAX_FRAME_PAYLOAD_LENGTH;
+            for (index, fragment) in packet
+                .message_id_and_payload
+                .chunks(Self::MAX_FRAME_PAYLOAD_LENGTH)
+                .enumerate()
+            {
+                let may_be_encrypted_fragment_payload = if packet.encrypted {
+                    assert!(!self.encrypted_connection_manager.is_handshaking());
+
+                    self.encrypted_connection_manager.encrypt_message(fragment)
+                } else {
+                    fragment.to_vec()
+                };
+
+                let frag_info = match index {
+                    0 => frame::AAPFrameFragmmentation::First,
+                    _ if index == payload_fragments_count - 1 => {
+                        frame::AAPFrameFragmmentation::Last
+                    }
+                    _ => frame::AAPFrameFragmmentation::Continuation,
+                };
+
+                frame_sender(AAPFrame {
+                    channel_id: packet.channel_id,
+                    encrypted: packet.encrypted,
+                    frag_info,
+                    r#type: packet.r#type,
+                    total_payload_length,
+                    // XXX could be incorrect if payload expands during encryption
+                    payload: may_be_encrypted_fragment_payload,
+                })
+                .await;
+            }
+        }
+    }
+
+    fn process_incoming_frame(&mut self, frame: AAPFrame) -> Option<Packet> {
         let frame_complete = matches!(
             frame.frag_info,
             AAPFrameFragmmentation::Last | AAPFrameFragmmentation::Unfragmented
         );
 
-        let mut defragmented_frame =
-            if let Some(mut pending_frame) = connected_state.pending_frame.take() {
-                assert!(pending_frame.channel_id == frame.channel_id);
-                assert!(pending_frame.encrypted == frame.encrypted);
-                assert!(pending_frame.r#type == frame.r#type);
-                assert!(matches!(
-                    frame.frag_info,
-                    AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last
-                ));
-                pending_frame.payload.extend_from_slice(&frame.payload);
-                pending_frame
-            } else {
-                assert!(!matches!(
-                    frame.frag_info,
-                    AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last
-                ));
-                frame
-            };
+        let mut defragmented_frame = if let Some(mut pending_frame) = self.pending_frame.take() {
+            assert!(pending_frame.channel_id == frame.channel_id);
+            assert!(pending_frame.encrypted == frame.encrypted);
+            assert!(pending_frame.r#type == frame.r#type);
+            assert!(matches!(
+                frame.frag_info,
+                AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last
+            ));
+            pending_frame.payload.extend_from_slice(&frame.payload);
+            pending_frame
+        } else {
+            assert!(!matches!(
+                frame.frag_info,
+                AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last
+            ));
+            frame
+        };
 
         if frame_complete {
             let payload = if defragmented_frame.encrypted {
-                connected_state
-                    .encrypted_connection_manager
+                self.encrypted_connection_manager
                     .decrypt_message(&mut defragmented_frame.payload)
             } else {
                 defragmented_frame.payload
             };
-
-            self.dispatch_incoming_packet(Packet {
+            Some(Packet {
                 channel_id: defragmented_frame.channel_id,
                 r#type: defragmented_frame.r#type,
                 encrypted: defragmented_frame.encrypted,
                 message_id_and_payload: payload,
             })
-            .await;
         } else {
-            connected_state.pending_frame = Some(defragmented_frame);
+            self.pending_frame = Some(defragmented_frame);
+            None
         }
     }
 }
