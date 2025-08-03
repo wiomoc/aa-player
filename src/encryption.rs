@@ -186,7 +186,7 @@ impl EncryptedConnectionManager {
             }
         }
         assert!(position == encrypted_message.len());
-        return message.unwrap();
+        message.unwrap()
     }
 
     pub(crate) fn is_handshaking(&self) -> bool {
@@ -227,7 +227,7 @@ impl ServerCertVerifier for CustomServerCertVerifier {
                 rustls::CertificateError::NotValidForNameContext { .. }
                 | rustls::CertificateError::NotValidForName,
             )) => Ok(ServerCertVerified::assertion()),
-            res @ _ => res,
+            res  => res,
         }
     }
 

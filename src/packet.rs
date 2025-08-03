@@ -1,5 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
 use log::debug;
+use prost::Message;
 
 use crate::{
     encryption::EncryptedConnectionManager,
@@ -25,6 +26,25 @@ impl Packet {
         let mut message_id_and_payload = Vec::with_capacity(2 + payload.len());
         message_id_and_payload.extend_from_slice(&message_id.to_be_bytes());
         message_id_and_payload.extend_from_slice(payload);
+
+        Self {
+            channel_id,
+            r#type,
+            encrypted,
+            message_id_and_payload,
+        }
+    }
+
+    pub(crate) fn new_from_proto_message(
+        channel_id: u8,
+        r#type: AAPFrameType,
+        encrypted: bool,
+        message_id: u16,
+        payload: &impl Message,
+    ) -> Self {
+        let mut message_id_and_payload = Vec::with_capacity(2 + payload.encoded_len());
+        message_id_and_payload.extend_from_slice(&message_id.to_be_bytes());
+        payload.encode_raw(&mut message_id_and_payload);
 
         Self {
             channel_id,

@@ -1,26 +1,28 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use byteorder::{BigEndian, ByteOrder};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use prost::Message;
 use tokio::{
     select,
-    sync::mpsc::Receiver,
+    sync::mpsc::{self, Receiver, Sender},
     time::{self, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    encryption::EncryptionManager,
-    frame::{AAPFrame, AAPFrameType},
-    packet::{Packet, PacketFramer},
-    packet_types::{
+    control_channel_packets::{
         CHANNEL_ID_CONTROL, MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION_REQUEST,
         MESSAGE_ID_GET_VERSION_RESPONSE, MESSAGE_ID_HANDSHAKE, MESSAGE_ID_OPEN_CHANNEL_REQUEST,
         MESSAGE_ID_PING_RESPONSE, MESSAGE_ID_SERVICE_DISCOVERY_REQUEST, build_auth_complete_packet,
-        build_focus_notification_packet, build_handshake_packet, build_ping_request_packet,
-        build_service_discovery_response_packet, build_version_request_packet,
+        build_channel_open_response, build_focus_notification_packet, build_handshake_packet,
+        build_ping_request_packet, build_service_discovery_response_packet,
+        build_version_request_packet,
     },
+    encryption::EncryptionManager,
+    frame::{AAPFrame, AAPFrameType},
+    packet::{Packet, PacketFramer},
     protos,
+    service::Service,
     usb::{self, UsbManager},
 };
 
@@ -31,8 +33,11 @@ enum PacketRouterConnectionState {
 }
 
 pub(crate) struct PacketRouter<'a> {
+    services: &'a [Box<dyn Service>],
+    channel_mapping: HashMap<u8, (i32, Sender<Packet>)>,
     usb_manager: &'a mut UsbManager,
     framer: PacketFramer,
+    outgoing_packet_queue_sender: Sender<Packet>,
     connection_state: PacketRouterConnectionState,
 }
 
@@ -115,20 +120,29 @@ enum PacketRouterResult {
 impl<'a> PacketRouter<'a> {
     pub(crate) async fn start(
         mut usb_manager: UsbManager,
-        mut outgoing_packet_queue: Receiver<Packet>,
+        cancel_token: CancellationToken,
+        services: &[Box<dyn Service>],
     ) {
         let encryption_manager = EncryptionManager::new();
 
-        loop {
+        while !cancel_token.is_cancelled() {
             let incoming_event = usb_manager.recv_frame().await;
             if matches!(incoming_event, usb::IncomingEvent::Connected) {
+                let (outgoing_packet_queue_sender, mut outgoing_packet_queue_receiver) =
+                    mpsc::channel(2);
+
                 let mut router = PacketRouter {
                     connection_state: PacketRouterConnectionState::WaitVersionResponse,
                     framer: PacketFramer::new(encryption_manager.new_connection()),
                     usb_manager: &mut usb_manager,
+                    services,
+                    outgoing_packet_queue_sender,
+                    channel_mapping: HashMap::new(),
                 };
 
-                router.handle_connection(&mut outgoing_packet_queue).await;
+                router
+                    .handle_connection(&mut outgoing_packet_queue_receiver, &cancel_token)
+                    .await;
             }
         }
         //usb_manager.terminate();
@@ -137,6 +151,7 @@ impl<'a> PacketRouter<'a> {
     async fn handle_connection(
         &mut self,
         outgoing_packet_queue: &mut Receiver<Packet>,
+        cancel_token: &CancellationToken,
     ) -> PacketRouterResult {
         self.send_packet(build_version_request_packet()).await;
 
@@ -144,6 +159,7 @@ impl<'a> PacketRouter<'a> {
             match &mut self.connection_state {
                 PacketRouterConnectionState::Established { heartbeat } => {
                     select! {
+                        biased;
                         outgoing_packet = outgoing_packet_queue.recv() => {
                             if let Some(outgoing_packet) = outgoing_packet {
                                 self.send_packet(outgoing_packet).await
@@ -163,6 +179,9 @@ impl<'a> PacketRouter<'a> {
                                 return PacketRouterResult::ConnectionClosedExternaly;
                             }
                         },
+                        _ = cancel_token.cancelled() => {
+                                return PacketRouterResult::ConnectionClosedInterally;
+                        }
                     }
                 }
                 _ => match self.usb_manager.recv_frame().await {
@@ -224,223 +243,142 @@ impl<'a> PacketRouter<'a> {
         if matches!(packet.r#type, AAPFrameType::Control)
             && packet.message_id() == MESSAGE_ID_OPEN_CHANNEL_REQUEST
         {
-            let open_channel_request = protos::ChannelOpenRequest::decode(packet.payload()).unwrap();
-            info!("open channel {:?}", open_channel_request);
+            self.handle_open_channel_request(packet).await;
+        } else if packet.channel_id == CHANNEL_ID_CONTROL {
+            self.handle_control_packet(packet).await;
+        } else if let Some((_service_id, service_incoming_packet_queue)) =
+            self.channel_mapping.get(&packet.channel_id)
+        {
+            service_incoming_packet_queue.send(packet).await.unwrap();
+        } else {
+            info!("received packet on unknown channel {}", packet.channel_id);
+        }
+    }
+
+    async fn handle_open_channel_request(&mut self, packet: Packet) {
+        let open_channel_request = protos::ChannelOpenRequest::decode(packet.payload()).unwrap();
+        info!("open channel {:?}", &open_channel_request);
+
+        let service_id = open_channel_request.service_id;
+        let channel_exists_for_service = self
+            .channel_mapping
+            .values()
+            .find(|(existing_service_id, _sender)| *existing_service_id == service_id)
+            .is_some();
+        if channel_exists_for_service {
+            warn!("Service {} has alread an opened channel", service_id);
+            self.send_packet(build_channel_open_response(
+                packet.channel_id,
+                protos::MessageStatus::StatusInvalidService,
+            ))
+            .await;
             return;
         }
-        match packet.channel_id {
-            CHANNEL_ID_CONTROL => match packet.message_id() {
-                MESSAGE_ID_SERVICE_DISCOVERY_REQUEST => {
-                    let service_discovery_request =
-                        protos::ServiceDiscoveryRequest::decode(packet.payload());
-                    info!(
-                        "service discovery request received: {:?}",
-                        &service_discovery_request
-                    );
 
-                    let service_discovery_response = protos::ServiceDiscoveryResponse {
-                        services: vec![
-                            protos::Service {
-                                id: 1,
-                                sensor_source_service: Some(protos::SensorSourceService {
-                                    sensors: vec![],
-                                    location_characterization: None,
-                                    supported_fuel_types: vec![protos::FuelType::Electric as i32],
-                                    supported_ev_connector_types: vec![
-                                        protos::EvConnectorType::Mennekes as i32,
-                                    ],
-                                }),
-                                ..Default::default()
-                            },
-                            protos::Service {
-                                id: 2,
-                                media_sink_service: Some(protos::MediaSinkService {
-                                    available_type: Some(
-                                        protos::MediaCodecType::MediaCodecVideoH264Bp as i32,
-                                    ),
-                                    video_configs: vec![protos::VideoConfiguration {
-                                        codec_resolution: Some(
-                                            protos::VideoCodecResolutionType::Video1280x720 as i32,
-                                        ),
-                                        frame_rate: Some(
-                                            protos::VideoFrameRateType::VideoFps60 as i32,
-                                        ),
-                                        width_margin: Some(0),
-                                        height_margin: Some(0),
-                                        density: Some(300),
-                                        video_codec_type: Some(
-                                            protos::MediaCodecType::MediaCodecVideoH264Bp as i32,
-                                        ),
-                                        ..Default::default()
-                                    }],
-                                    available_while_in_call: Some(true),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                            protos::Service {
-                                id: 3,
-                                input_source_service: Some(protos::InputSourceService {
-                                    touchscreen: vec![protos::input_source_service::TouchScreen {
-                                        width: 1280,
-                                        height: 720,
-                                        r#type: Some(protos::TouchScreenType::Capacitive as i32),
-                                        is_secondary: Some(false),
-                                    }],
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                            protos::Service {
-                                id: 4,
-                                media_sink_service: Some(protos::MediaSinkService {
-                                    available_type: Some(
-                                        protos::MediaCodecType::MediaCodecAudioPcm as i32,
-                                    ),
-                                    audio_type: Some(
-                                        protos::AudioStreamType::AudioStreamSystemAudio as i32,
-                                    ),
-                                    audio_configs: vec![protos::AudioConfiguration {
-                                        sampling_rate: 16000,
-                                        number_of_bits: 16,
-                                        number_of_channels: 1,
-                                    }],
-                                    available_while_in_call: Some(true),
+        let service = self
+            .services
+            .iter()
+            .find(|service| service.get_id() == service_id);
 
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                            /*protos::Service {
-                                id: 5,
-                                media_sink_service: Some(protos::MediaSinkService {
-                                    available_type: Some(
-                                        protos::MediaCodecType::MediaCodecAudioPcm as i32,
-                                    ),
-                                    audio_type: Some(
-                                        protos::AudioStreamType::AudioStreamMedia as i32,
-                                    ),
-                                    audio_configs: vec![protos::AudioConfiguration {
-                                        sampling_rate: 48000,
-                                        number_of_bits: 16,
-                                        number_of_channels: 2,
-                                    }],
-                                    available_while_in_call: Some(true),
+        let service = if let Some(service) = service {
+            service
+        } else {
+            warn!("Unknown service {}", service_id);
+            self.send_packet(build_channel_open_response(
+                packet.channel_id,
+                protos::MessageStatus::StatusInvalidService,
+            ))
+            .await;
+            return;
+        };
 
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                            protos::Service {
-                                id: 6,
-                                media_sink_service: Some(protos::MediaSinkService {
-                                    available_type: Some(
-                                        protos::MediaCodecType::MediaCodecAudioPcm as i32,
-                                    ),
-                                    audio_type: Some(
-                                        protos::AudioStreamType::AudioStreamTelephony as i32,
-                                    ),
-                                    audio_configs: vec![protos::AudioConfiguration {
-                                        sampling_rate: 16000,
-                                        number_of_bits: 16,
-                                        number_of_channels: 1,
-                                    }],
-                                    available_while_in_call: Some(true),
+        let (incoming_packet_queue_sender, incoming_packet_queue_receiver) = mpsc::channel(2);
 
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                            protos::Service {
-                                id: 7,
-                                media_sink_service: Some(protos::MediaSinkService {
-                                    available_type: Some(
-                                        protos::MediaCodecType::MediaCodecAudioPcm as i32,
-                                    ),
-                                    audio_type: Some(
-                                        protos::AudioStreamType::AudioStreamGuidance as i32,
-                                    ),
-                                    audio_configs: vec![protos::AudioConfiguration {
-                                        sampling_rate: 16000,
-                                        number_of_bits: 16,
-                                        number_of_channels: 1,
-                                    }],
-                                    available_while_in_call: Some(true),
+        let packet_sender = ChannelPacketSender {
+            channel_id: packet.channel_id,
+            sender: self.outgoing_packet_queue_sender.clone(),
+        };
 
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },*/
-                            protos::Service {
-                                id: 8,
-                                media_source_service: Some(protos::MediaSourceService {
-                                    available_type: Some(
-                                        protos::MediaCodecType::MediaCodecAudioPcm as i32,
-                                    ),
-                                    audio_config: Some(protos::AudioConfiguration {
-                                        sampling_rate: 16000,
-                                        number_of_bits: 16,
-                                        number_of_channels: 1,
-                                    }),
-                                    available_while_in_call: Some(true),
-                                }),
-                                ..Default::default()
-                            },
-                        ],
-                        driver_position: Some(protos::DriverPosition::Center as i32),
-                        display_name: Some("aa_player".to_string()),
-                        connection_configuration: Some(protos::ConnectionConfiguration {
-                            ping_configuration: Some(protos::PingConfiguration {
-                                interval_ms: Some(3000),
-                                timeout_ms: Some(1000),
-                                high_latency_threshold_ms: Some(100000),
-                                ..Default::default()
-                            }),
+        self.channel_mapping.insert(
+            packet.channel_id,
+            (service_id, incoming_packet_queue_sender),
+        );
+
+        service.instanciate(packet_sender, incoming_packet_queue_receiver);
+        self.send_packet(build_channel_open_response(
+            packet.channel_id,
+            protos::MessageStatus::StatusSuccess,
+        ))
+        .await;
+    }
+
+    async fn handle_control_packet(&mut self, packet: Packet) {
+        match packet.message_id() {
+            MESSAGE_ID_SERVICE_DISCOVERY_REQUEST => {
+                let service_discovery_request =
+                    protos::ServiceDiscoveryRequest::decode(packet.payload());
+                info!(
+                    "service discovery request received: {:?}",
+                    &service_discovery_request
+                );
+
+                let service_discovery_response = protos::ServiceDiscoveryResponse {
+                    services: self
+                        .services
+                        .iter()
+                        .map(|service| service.get_descriptor())
+                        .collect(),
+                    display_name: Some("aa_player".to_string()),
+                    connection_configuration: Some(protos::ConnectionConfiguration {
+                        ping_configuration: Some(protos::PingConfiguration {
+                            interval_ms: Some(Heartbeater::PING_INTERVAL_MS as u32),
+                            timeout_ms: Some(Heartbeater::PING_MAX_RTT_MS as u32),
+                            high_latency_threshold_ms: Some(100000),
                             ..Default::default()
                         }),
-                        headunit_info: Some(protos::HeadUnitInfo {
-                            make: Some("wiomoc".to_string()),
-                            model: Some("aa_player".to_string()),
-                            year: Some("2025".to_string()),
-                            vehicle_id: Some("12345".to_string()),
-                            head_unit_make: Some("wiomoc".to_string()),
-                            head_unit_model: Some("aa_player".to_string()),
-                            head_unit_software_build: Some("42".to_string()),
-                            head_unit_software_version: Some("1.0".to_string()),
-                        }),
                         ..Default::default()
-                    };
+                    }),
+                    headunit_info: Some(protos::HeadUnitInfo {
+                        make: Some("wiomoc".to_string()),
+                        model: Some("aa_player".to_string()),
+                        year: Some("2025".to_string()),
+                        vehicle_id: Some("12345".to_string()),
+                        head_unit_make: Some("wiomoc".to_string()),
+                        head_unit_model: Some("aa_player".to_string()),
+                        head_unit_software_build: Some("42".to_string()),
+                        head_unit_software_version: Some("1.0".to_string()),
+                    }),
+                    ..Default::default()
+                };
 
-                    self.send_packet(build_service_discovery_response_packet(
-                        service_discovery_response,
-                    ))
-                    .await;
+                self.send_packet(build_service_discovery_response_packet(
+                    service_discovery_response,
+                ))
+                .await;
+            }
+            MESSAGE_ID_PING_RESPONSE => {
+                if let PacketRouterConnectionState::Established { heartbeat } =
+                    &mut self.connection_state
+                {
+                    heartbeat.handle_heartbeat_ping_response(packet);
                 }
-                MESSAGE_ID_PING_RESPONSE => {
-                    if let PacketRouterConnectionState::Established { heartbeat } =
-                        &mut self.connection_state
-                    {
-                        heartbeat.handle_heartbeat_ping_response(packet);
-                    }
-                }
-                MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION_REQUEST => {
-                    assert!(matches!(
-                        self.connection_state,
-                        PacketRouterConnectionState::Established { .. }
-                    ));
-                    let request =
-                        protos::AudioFocusRequestNotification::decode(packet.payload()).unwrap();
-                    self.send_packet(build_focus_notification_packet(
-                        protos::AudioFocusStateType::AudioFocusStateLoss,
-                    ))
-                    .await;
-                }
-                message_id @ _ => info!(
-                    "received packet on control channel with unknown message_id {}",
-                    message_id
-                ),
-            },
-            channel_id @ _ => info!("received packet on unknown channel {}", channel_id),
+            }
+            MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION_REQUEST => {
+                assert!(matches!(
+                    self.connection_state,
+                    PacketRouterConnectionState::Established { .. }
+                ));
+                let _request =
+                    protos::AudioFocusRequestNotification::decode(packet.payload()).unwrap();
+                self.send_packet(build_focus_notification_packet(
+                    protos::AudioFocusStateType::AudioFocusStateLoss,
+                ))
+                .await;
+            }
+            message_id => info!(
+                "received packet on control channel with unknown message_id {}",
+                message_id
+            ),
         }
     }
 
@@ -450,5 +388,27 @@ impl<'a> PacketRouter<'a> {
                 self.usb_manager.send_frame(frame).await.unwrap()
             })
             .await;
+    }
+}
+
+pub(crate) struct ChannelPacketSender {
+    sender: Sender<Packet>,
+    channel_id: u8,
+}
+
+impl ChannelPacketSender {
+    pub(crate) async fn send_proto(
+        &self,
+        message_id: u16,
+        payload: &impl Message,
+    ) -> Result<(), mpsc::error::SendError<Packet>> {
+        let packet = Packet::new_from_proto_message(
+            self.channel_id,
+            AAPFrameType::Control,
+            true,
+            message_id,
+            payload,
+        );
+        self.sender.send(packet).await
     }
 }

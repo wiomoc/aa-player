@@ -145,7 +145,7 @@ impl<W: AsyncWriter> FrameEncoder<W> for AAPFrameCodec {
 
         header[1] = flags;
 
-        writer.write_all(&header).await?;
+        writer.write_all(header).await?;
         writer.write_all(&item.payload).await?;
         Ok(())
     }

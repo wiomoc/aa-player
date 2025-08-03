@@ -16,7 +16,7 @@ use nusb::{
 };
 use tokio::{
     select,
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -24,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 use crate::frame::{AAPFrame, AAPFrameCodec, AsyncReader, AsyncWriter, FrameDecoder, FrameEncoder};
 
 pub struct UsbManager {
-    terminate_sender: oneshot::Sender<()>,
     incoming_queue_receiver: mpsc::Receiver<IncomingEvent>,
     outgoing_queue_sender: mpsc::Sender<AAPFrame>,
 }
@@ -48,8 +47,7 @@ pub(crate) enum IncomingEvent {
 
 //impl<C: FrameDecoder<UsbReader> + FrameEncoder<UsbWriter>> UsbManager {
 impl UsbManager {
-    pub fn start() -> Self {
-        let (terminate_sender, terminate_receiver) = oneshot::channel::<()>();
+    pub fn start(cancel_token: CancellationToken) -> Self {
         let (incoming_queue_sender, incoming_queue_receiver) = mpsc::channel::<IncomingEvent>(8);
         let (outgoing_queue_sender, outgoing_queue_receiver) = mpsc::channel::<AAPFrame>(8);
 
@@ -60,12 +58,11 @@ impl UsbManager {
         };
 
         let usb_manager = UsbManager {
-            terminate_sender,
             incoming_queue_receiver,
             outgoing_queue_sender,
         };
 
-        tokio::spawn(state.start_device_handle_loop(terminate_receiver));
+        tokio::spawn(state.start_device_handle_loop(cancel_token));
 
         usb_manager
     }
@@ -83,10 +80,6 @@ impl UsbManager {
             .await
             .unwrap_or(IncomingEvent::Closed)
     }
-
-    pub fn terminate(self) {
-        self.terminate_sender.send(()).unwrap();
-    }
 }
 
 impl UsbInternalState {
@@ -94,35 +87,33 @@ impl UsbInternalState {
     const AOA_PID_V1: u16 = 0x2D00;
     const AOA_PID_V2: u16 = 0x2D01;
 
-    async fn start_device_handle_loop(mut self, mut terminate_receiver: oneshot::Receiver<()>) {
+    async fn start_device_handle_loop(mut self, cancel_token: CancellationToken) {
+        let mut watch = nusb::watch_devices().expect("can't start watching devices");
+        let initial_devices = nusb::list_devices().expect("can't list devices");
+        for device in initial_devices {
+            self.handle_connected_device(device).await;
+        }
+
         loop {
-            let mut watch = nusb::watch_devices().expect("can't start watching devices");
-            let initial_devices = nusb::list_devices().expect("can't list devices");
-            for device in initial_devices {
-                self.handle_connected_device(device).await;
-            }
+            let event = select! {
+                event = watch.next() => event,
+                _ = cancel_token.cancelled() => {
+                    if let Some(device_state) = self.connected_device.as_ref() {
+                        device_state.terminate_connection_token.cancel();
+                    }
+                    return;
+                }
+            };
 
-            loop {
-                let event = select! {
-                    event = watch.next() => event,
-                    _ = &mut terminate_receiver => {
-                        if let Some(device_state) = self.connected_device.as_ref() {
-                            device_state.terminate_connection_token.cancel();
-                        }
-                        return;
-                    }
-                };
-
-                match event {
-                    Some(HotplugEvent::Connected(device)) => {
-                        self.handle_connected_device(device).await;
-                    }
-                    Some(HotplugEvent::Disconnected(device_id)) => {
-                        self.handle_disconnected_device(device_id).await;
-                    }
-                    None => {
-                        return;
-                    }
+            match event {
+                Some(HotplugEvent::Connected(device)) => {
+                    self.handle_connected_device(device).await;
+                }
+                Some(HotplugEvent::Disconnected(device_id)) => {
+                    self.handle_disconnected_device(device_id).await;
+                }
+                None => {
+                    return;
                 }
             }
         }
@@ -130,21 +121,21 @@ impl UsbInternalState {
 
     async fn handle_connected_device(&mut self, device_info: DeviceInfo) {
         {
-            if let Some(device_state) = self.connected_device.as_ref() {
-                if !device_state.terminate_connection_token.is_cancelled() {
-                    return;
-                }
+            if let Some(device_state) = self.connected_device.as_ref()
+                && !device_state.terminate_connection_token.is_cancelled()
+            {
+                return;
             }
         }
         let vid = device_info.vendor_id();
         let pid = device_info.product_id();
 
         if vid == Self::AOA_VID && (pid == Self::AOA_PID_V1 || pid == Self::AOA_PID_V2) {
-            self.handle_connected_aoa_device(device_info).await;
+            let _ = self.handle_connected_aoa_device(device_info).await;
         } else {
             let res = Self::switch_device_to_aoa_mode(device_info).await;
             if let Err(err) = res {
-                warn!("switching device to aoa failed {:?}", err);
+                warn!("switching device to aoa failed {err:?}");
             }
         }
     }
@@ -169,7 +160,7 @@ impl UsbInternalState {
         };
 
         if let Some((
-            config_num,
+            _config_num,
             interface_num,
             in_endpoint_address,
             out_endpoint_address,
