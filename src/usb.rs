@@ -144,7 +144,7 @@ impl UsbInternalState {
         &mut self,
         device_info: DeviceInfo,
     ) -> Result<(), nusb::Error> {
-        info!("handle connected aoa device {:?}", device_info);
+        info!("handle connected aoa device {device_info:?}");
 
         let device = match device_info.open() {
             Ok(device) => device,
@@ -172,20 +172,16 @@ impl UsbInternalState {
                         endpoint.transfer_type() == EndpointType::Bulk
                             && endpoint.direction() == Direction::In
                     }) {
-                        if let Some(out_endpoint) = alt_settings.endpoints().find(|endpoint| {
+                        alt_settings.endpoints().find(|endpoint| {
                             endpoint.transfer_type() == EndpointType::Bulk
                                 && endpoint.direction() == Direction::Out
-                        }) {
-                            Some((
+                        }).map(|out_endpoint| (
                                 config.configuration_value(),
                                 interface.interface_number(),
                                 in_endpoint.address(),
                                 out_endpoint.address(),
                                 in_endpoint.max_packet_size(),
                             ))
-                        } else {
-                            None
-                        }
                     } else {
                         None
                     }
@@ -200,7 +196,7 @@ impl UsbInternalState {
             let interface = match device.claim_interface(interface_num) {
                 Ok(interface) => interface,
                 Err(err) => {
-                    error!("could not claim {}", interface_num);
+                    error!("could not claim {interface_num}");
                     return Err(err);
                 }
             };
@@ -216,7 +212,7 @@ impl UsbInternalState {
             {
                 // empty queue before starting a new connection
                 let mut outgoing_queue_receiver = self.outgoing_queue_receiver.lock().await;
-                while outgoing_queue_receiver.len() > 0 {
+                while !outgoing_queue_receiver.is_empty() {
                     outgoing_queue_receiver.try_recv().unwrap();
                 }
             }
@@ -240,7 +236,7 @@ impl UsbInternalState {
     }
 
     async fn handle_disconnected_device(&mut self, device_id: DeviceId) {
-        info!("disconnected device {:?}", device_id);
+        info!("disconnected device {device_id:?}");
         if let Some(device_state) = self
             .connected_device
             .take_if(|device_state| device_state.connected_device_id == device_id)
@@ -268,7 +264,7 @@ impl UsbInternalState {
             let result = codec.read_frame(&mut reader).await;
             match result {
                 Err(err) => {
-                    error!("receiving frame failed {:?}", err);
+                    error!("receiving frame failed {err:?}");
                     terminate_connection_token.cancel();
                     incoming_queue.send(IncomingEvent::Closed).await.unwrap();
                     return;
@@ -308,7 +304,7 @@ impl UsbInternalState {
                 let result = codec.write_frame(frame, &mut writer).await;
 
                 if let Err(err) = result {
-                    error!("sending frame failed {:?}", err);
+                    error!("sending frame failed {err:?}");
                     terminate_connection_token.cancel();
                     break;
                 }
@@ -337,7 +333,7 @@ impl UsbInternalState {
         let interface = match device.claim_interface(0) {
             Ok(interface) => interface,
             Err(err) => {
-                warn!("could not claim {:?}", err);
+                warn!("could not claim {err:?}");
                 return Err(err);
             }
         };
@@ -441,7 +437,7 @@ impl UsbReader {
 
             match response {
                 Ok(packet) => {
-                    if packet.len() == 0 {
+                    if packet.is_empty() {
                         select! {
                             _ = self.terminate_connection_token.cancelled() => { return Err(Error::from(ErrorKind::UnexpectedEof)); }
                             _ = time::sleep(Duration::from_millis(2)) => {}
@@ -526,7 +522,7 @@ impl UsbWriter {
 
 impl AsyncWriter for UsbWriter {
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), std::io::Error> {
-        let mut buf = &buf[..];
+        let mut buf = buf;
 
         while !buf.is_empty() {
             let write_buffer = self.buffer.as_mut().unwrap();

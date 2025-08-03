@@ -118,9 +118,7 @@ impl PacketFramer {
             .await
         } else {
             let total_payload_length = packet.message_id_and_payload.len();
-            let payload_fragments_count = (total_payload_length + Self::MAX_FRAME_PAYLOAD_LENGTH
-                - 1)
-                / Self::MAX_FRAME_PAYLOAD_LENGTH;
+            let payload_fragments_count = total_payload_length.div_ceil(Self::MAX_FRAME_PAYLOAD_LENGTH);
             for (index, fragment) in packet
                 .message_id_and_payload
                 .chunks(Self::MAX_FRAME_PAYLOAD_LENGTH)

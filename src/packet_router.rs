@@ -263,10 +263,9 @@ impl<'a> PacketRouter<'a> {
         let channel_exists_for_service = self
             .channel_mapping
             .values()
-            .find(|(existing_service_id, _sender)| *existing_service_id == service_id)
-            .is_some();
+            .any(|(existing_service_id, _sender)| *existing_service_id == service_id);
         if channel_exists_for_service {
-            warn!("Service {} has alread an opened channel", service_id);
+            warn!("Service {service_id} has alread an opened channel");
             self.send_packet(build_channel_open_response(
                 packet.channel_id,
                 protos::MessageStatus::StatusInvalidService,
@@ -283,7 +282,7 @@ impl<'a> PacketRouter<'a> {
         let service = if let Some(service) = service {
             service
         } else {
-            warn!("Unknown service {}", service_id);
+            warn!("Unknown service {service_id}");
             self.send_packet(build_channel_open_response(
                 packet.channel_id,
                 protos::MessageStatus::StatusInvalidService,
@@ -376,8 +375,7 @@ impl<'a> PacketRouter<'a> {
                 .await;
             }
             message_id => info!(
-                "received packet on control channel with unknown message_id {}",
-                message_id
+                "received packet on control channel with unknown message_id {message_id}"
             ),
         }
     }
@@ -404,7 +402,7 @@ impl ChannelPacketSender {
     ) -> Result<(), mpsc::error::SendError<Packet>> {
         let packet = Packet::new_from_proto_message(
             self.channel_id,
-            AAPFrameType::Control,
+            AAPFrameType::ChannelSpecific,
             true,
             message_id,
             payload,
