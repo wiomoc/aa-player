@@ -82,13 +82,15 @@ impl<R: AsyncReader> FrameDecoder<R> for AAPFrameCodec {
         let fragment_payload_length = BigEndian::read_u16(&header[2..]) as usize;
 
         let total_payload_length = if matches!(frag_info, AAPFrameFragmmentation::First) {
-            let mut length_buffer = [header[2], header[3], 0, 0];
-            reader.read_exact(&mut length_buffer[2..]).await?;
+            let mut total_length_buffer = [0u8; 4];
+            reader.read_exact(&mut total_length_buffer).await?;
 
-            BigEndian::read_u32(&length_buffer) as usize
+            BigEndian::read_u32(&total_length_buffer) as usize
         } else {
             fragment_payload_length
         };
+
+        assert!(total_payload_length >= fragment_payload_length);
 
         let encrypted = (flags & AAPFrameCodec::ENCRYPTED_PAYLOAD_MASK)
             == AAPFrameCodec::ENCRYPTED_PAYLOAD_MASK;

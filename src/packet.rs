@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ByteOrder};
-use log::debug;
+use log::{debug, trace};
 use prost::Message;
 
 use crate::{
@@ -96,7 +96,7 @@ impl PacketFramer {
         packet: Packet,
         frame_sender: impl AsyncFn(AAPFrame),
     ) {
-        debug!("> {:?}", &packet);
+        trace!("> {:?}", &packet);
 
         if packet.message_id_and_payload.len() <= Self::MAX_FRAME_PAYLOAD_LENGTH {
             let may_be_encrypted_payload = if packet.encrypted {
@@ -118,7 +118,8 @@ impl PacketFramer {
             .await
         } else {
             let total_payload_length = packet.message_id_and_payload.len();
-            let payload_fragments_count = total_payload_length.div_ceil(Self::MAX_FRAME_PAYLOAD_LENGTH);
+            let payload_fragments_count =
+                total_payload_length.div_ceil(Self::MAX_FRAME_PAYLOAD_LENGTH);
             for (index, fragment) in packet
                 .message_id_and_payload
                 .chunks(Self::MAX_FRAME_PAYLOAD_LENGTH)
@@ -152,46 +153,41 @@ impl PacketFramer {
         }
     }
 
-    pub(crate) fn process_incoming_frame(&mut self, frame: AAPFrame) -> Option<Packet> {
-        let frame_complete = matches!(
-            frame.frag_info,
-            AAPFrameFragmmentation::Last | AAPFrameFragmmentation::Unfragmented
-        );
+    pub(crate) fn process_incoming_frame(&mut self, mut frame: AAPFrame) -> Option<Packet> {
+        if frame.encrypted {
+            let decrypted_payload = self
+                .encrypted_connection_manager
+                .decrypt_message(&mut frame.payload);
+            frame.payload = decrypted_payload;
+        }
 
-        let mut defragmented_frame = if let Some(mut pending_frame) = self.pending_frame.take() {
-            assert!(pending_frame.channel_id == frame.channel_id);
-            assert!(pending_frame.encrypted == frame.encrypted);
-            assert!(pending_frame.r#type == frame.r#type);
-            assert!(matches!(
-                frame.frag_info,
-                AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last
-            ));
-            pending_frame.payload.extend_from_slice(&frame.payload);
-            pending_frame
-        } else {
-            assert!(!matches!(
-                frame.frag_info,
-                AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last
-            ));
-            frame
+        let defragmented_frame = match frame.frag_info {
+            AAPFrameFragmmentation::First => {
+                assert!(self.pending_frame.is_none());
+                self.pending_frame = Some(frame);
+                return None;
+            }
+            AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last => {
+                let mut pending_frame = self.pending_frame.take().expect("pending frame missing");
+                assert!(pending_frame.channel_id == frame.channel_id);
+                assert!(pending_frame.encrypted == frame.encrypted);
+                assert!(pending_frame.r#type == frame.r#type);
+
+                pending_frame.payload.extend_from_slice(&frame.payload);
+                if matches!(frame.frag_info, AAPFrameFragmmentation::Continuation) {
+                    self.pending_frame = Some(pending_frame);
+                    return None;
+                }
+                pending_frame
+            }
+            AAPFrameFragmmentation::Unfragmented => frame,
         };
 
-        if frame_complete {
-            let payload = if defragmented_frame.encrypted {
-                self.encrypted_connection_manager
-                    .decrypt_message(&mut defragmented_frame.payload)
-            } else {
-                defragmented_frame.payload
-            };
-            Some(Packet {
-                channel_id: defragmented_frame.channel_id,
-                r#type: defragmented_frame.r#type,
-                encrypted: defragmented_frame.encrypted,
-                message_id_and_payload: payload,
-            })
-        } else {
-            self.pending_frame = Some(defragmented_frame);
-            None
-        }
+        Some(Packet {
+            channel_id: defragmented_frame.channel_id,
+            r#type: defragmented_frame.r#type,
+            encrypted: defragmented_frame.encrypted,
+            message_id_and_payload: defragmented_frame.payload,
+        })
     }
 }

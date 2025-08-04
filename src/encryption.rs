@@ -163,7 +163,7 @@ impl EncryptedConnectionManager {
             let UnbufferedStatus { discard, state, .. } = self
                 .conn
                 .process_tls_records(&mut encrypted_message[position..]);
-            let state = state.unwrap();
+            let state = state. unwrap();
             position += discard;
             match state {
                 ConnectionState::ReadTraffic(mut read_traffic) => {

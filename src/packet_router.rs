@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use prost::Message;
 use tokio::{
     select,
@@ -205,7 +205,7 @@ impl<'a> PacketRouter<'a> {
     }
 
     async fn dispatch_incoming_packet(&mut self, mut packet: Packet) {
-        debug!("< {:?}", &packet);
+        trace!("< {:?}", &packet);
         match &mut self.connection_state {
             PacketRouterConnectionState::WaitVersionResponse => {
                 assert!(packet.channel_id == CHANNEL_ID_CONTROL);
@@ -231,8 +231,6 @@ impl<'a> PacketRouter<'a> {
                 }
             }
             PacketRouterConnectionState::Established { heartbeat } => {
-                info!("received normal packet");
-
                 heartbeat.restart_ping_countdown_timer();
                 self.decode_packet(packet).await;
             }
@@ -370,7 +368,7 @@ impl<'a> PacketRouter<'a> {
                 let _request =
                     protos::AudioFocusRequestNotification::decode(packet.payload()).unwrap();
                 self.send_packet(build_focus_notification_packet(
-                    protos::AudioFocusStateType::AudioFocusStateLoss,
+                    protos::AudioFocusStateType::AudioFocusStateGainMediaOnly,
                 ))
                 .await;
             }

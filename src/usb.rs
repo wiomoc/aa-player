@@ -442,6 +442,8 @@ impl UsbReader {
                             _ = self.terminate_connection_token.cancelled() => { return Err(Error::from(ErrorKind::UnexpectedEof)); }
                             _ = time::sleep(Duration::from_millis(2)) => {}
                         };
+                        self.buffer = Some(packet);
+                        self.buffer_offset = 0;
                     } else {
                         trace!("usb < {:?}", &packet);
                         self.buffer = Some(packet);
