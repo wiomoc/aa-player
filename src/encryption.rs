@@ -1,5 +1,6 @@
 use std::{net::Ipv4Addr, sync::Arc};
 
+use log::error;
 use rustls::{
     ClientConfig, RootCertStore,
     client::{
@@ -78,7 +79,10 @@ impl EncryptionManager {
 }
 
 impl EncryptedConnectionManager {
-    pub(crate) fn process_handshake_message(&mut self, payload: &mut [u8]) -> Option<Vec<u8>> {
+    pub(crate) fn process_handshake_message(
+        &mut self,
+        payload: &mut [u8],
+    ) -> Result<Option<Vec<u8>>, ()> {
         assert!(self.is_handshaking);
 
         let mut position = 0usize;
@@ -87,7 +91,7 @@ impl EncryptedConnectionManager {
             let UnbufferedStatus { discard, state, .. } =
                 self.conn.process_tls_records(&mut payload[position..]);
             position += discard;
-            let state = state.unwrap();
+            let state = state.map_err(|err| error!("couldn't process handshake {err:?}"))?;
 
             match state {
                 ConnectionState::EncodeTlsData(mut encode_tls_data) => {
@@ -108,29 +112,31 @@ impl EncryptedConnectionManager {
                         outgoing_message = Some(vec![0u8; message_size]);
                         outgoing_message.as_mut().unwrap()
                     };
-                    encode_tls_data.encode(message).unwrap();
+                    encode_tls_data
+                        .encode(message)
+                        .map_err(|err| error!("couldn't process handshake {err:?}"))?;
                 }
                 ConnectionState::TransmitTlsData(transmit_tls_data) => {
                     transmit_tls_data.done();
-                    return outgoing_message;
+                    return Ok(outgoing_message);
                 }
                 ConnectionState::WriteTraffic(_write_traffic) => {
                     self.is_handshaking = false;
                     assert!(position == payload.len());
-                    return None;
+                    return Ok(None);
                 }
 
-                _ => return None,
+                _ => return Ok(None),
             }
         }
     }
 
-    pub(crate) fn encrypt_message(&mut self, message: &[u8]) -> Vec<u8> {
+    pub(crate) fn encrypt_message(&mut self, message: &[u8]) -> Result<Vec<u8>, ()> {
         assert!(!self.is_handshaking);
 
         let estimated_tls_overhead_length = 40usize;
         let UnbufferedStatus { state, .. } = self.conn.process_tls_records(&mut []);
-        let state = state.unwrap();
+        let state = state.map_err(|err| error!("couldn't encrypt {err:?}"))?;
         match state {
             ConnectionState::WriteTraffic(mut write_traffic) => {
                 let mut encrypted_message =
@@ -139,14 +145,17 @@ impl EncryptedConnectionManager {
                     match write_traffic.encrypt(message, &mut encrypted_message) {
                         Ok(size) => {
                             encrypted_message.truncate(size);
-                            return encrypted_message;
+                            return Ok(encrypted_message);
                         }
                         Err(EncryptError::InsufficientSize(InsufficientSizeError {
                             required_size,
                         })) => {
                             encrypted_message.resize(required_size, 0);
                         }
-                        Err(_err) => unreachable!(),
+                        Err(err) => {
+                            error!("couldn't encrypt {err:?}");
+                            return Err(());
+                        }
                     }
                 }
             }
@@ -154,7 +163,7 @@ impl EncryptedConnectionManager {
         }
     }
 
-    pub(crate) fn decrypt_message(&mut self, encrypted_message: &mut [u8]) -> Vec<u8> {
+    pub(crate) fn decrypt_message(&mut self, encrypted_message: &mut [u8]) -> Result<Vec<u8>, ()> {
         assert!(!self.is_handshaking);
 
         let mut position = 0usize;
@@ -163,12 +172,12 @@ impl EncryptedConnectionManager {
             let UnbufferedStatus { discard, state, .. } = self
                 .conn
                 .process_tls_records(&mut encrypted_message[position..]);
-            let state = state. unwrap();
+            let state = state.map_err(|err| error!("couldn't decrypt {err:?}"))?;
             position += discard;
             match state {
                 ConnectionState::ReadTraffic(mut read_traffic) => {
                     while let Some(record) = read_traffic.next_record() {
-                        let record = record.unwrap();
+                        let record = record.map_err(|err| error!("couldn't decrypt {err:?}"))?;
                         position += record.discard;
 
                         if let Some(ref mut message) = message {
@@ -186,7 +195,9 @@ impl EncryptedConnectionManager {
             }
         }
         assert!(position == encrypted_message.len());
-        message.unwrap()
+        message
+            .ok_or(())
+            .map_err(|err| error!("couldn't decrypt {err:?}"))
     }
 
     pub(crate) fn is_handshaking(&self) -> bool {
@@ -227,7 +238,7 @@ impl ServerCertVerifier for CustomServerCertVerifier {
                 rustls::CertificateError::NotValidForNameContext { .. }
                 | rustls::CertificateError::NotValidForName,
             )) => Ok(ServerCertVerified::assertion()),
-            res  => res,
+            res => res,
         }
     }
 

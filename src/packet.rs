@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ByteOrder};
-use log::{debug, trace};
+use log::trace;
 use prost::Message;
 
 use crate::{
@@ -82,7 +82,10 @@ impl PacketFramer {
         }
     }
 
-    pub(crate) fn process_handshake_message(&mut self, payload: &mut [u8]) -> Option<Vec<u8>> {
+    pub(crate) fn process_handshake_message(
+        &mut self,
+        payload: &mut [u8],
+    ) -> Result<Option<Vec<u8>>, ()> {
         self.encrypted_connection_manager
             .process_handshake_message(payload)
     }
@@ -95,14 +98,14 @@ impl PacketFramer {
         &mut self,
         packet: Packet,
         frame_sender: impl AsyncFn(AAPFrame),
-    ) {
+    ) -> Result<(), ()> {
         trace!("> {:?}", &packet);
 
         if packet.message_id_and_payload.len() <= Self::MAX_FRAME_PAYLOAD_LENGTH {
             let may_be_encrypted_payload = if packet.encrypted {
                 assert!(!self.encrypted_connection_manager.is_handshaking());
                 self.encrypted_connection_manager
-                    .encrypt_message(&packet.message_id_and_payload)
+                    .encrypt_message(&packet.message_id_and_payload)?
             } else {
                 packet.message_id_and_payload
             };
@@ -128,7 +131,8 @@ impl PacketFramer {
                 let may_be_encrypted_fragment_payload = if packet.encrypted {
                     assert!(!self.encrypted_connection_manager.is_handshaking());
 
-                    self.encrypted_connection_manager.encrypt_message(fragment)
+                    self.encrypted_connection_manager
+                        .encrypt_message(fragment)?
                 } else {
                     fragment.to_vec()
                 };
@@ -151,13 +155,17 @@ impl PacketFramer {
                 .await;
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn process_incoming_frame(&mut self, mut frame: AAPFrame) -> Option<Packet> {
+    pub(crate) fn process_incoming_frame(
+        &mut self,
+        mut frame: AAPFrame,
+    ) -> Result<Option<Packet>, ()> {
         if frame.encrypted {
             let decrypted_payload = self
                 .encrypted_connection_manager
-                .decrypt_message(&mut frame.payload);
+                .decrypt_message(&mut frame.payload)?;
             frame.payload = decrypted_payload;
         }
 
@@ -165,7 +173,7 @@ impl PacketFramer {
             AAPFrameFragmmentation::First => {
                 assert!(self.pending_frame.is_none());
                 self.pending_frame = Some(frame);
-                return None;
+                return Ok(None);
             }
             AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last => {
                 let mut pending_frame = self.pending_frame.take().expect("pending frame missing");
@@ -176,18 +184,18 @@ impl PacketFramer {
                 pending_frame.payload.extend_from_slice(&frame.payload);
                 if matches!(frame.frag_info, AAPFrameFragmmentation::Continuation) {
                     self.pending_frame = Some(pending_frame);
-                    return None;
+                    return Ok(None);
                 }
                 pending_frame
             }
             AAPFrameFragmmentation::Unfragmented => frame,
         };
 
-        Some(Packet {
+        Ok(Some(Packet {
             channel_id: defragmented_frame.channel_id,
             r#type: defragmented_frame.r#type,
             encrypted: defragmented_frame.encrypted,
             message_id_and_payload: defragmented_frame.payload,
-        })
+        }))
     }
 }

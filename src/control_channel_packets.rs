@@ -15,6 +15,8 @@ pub(crate) const MESSAGE_ID_PING_REQUEST: u16 = 0x0B;
 pub(crate) const MESSAGE_ID_PING_RESPONSE: u16 = 0x0C;
 pub(crate) const MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION_REQUEST: u16 = 0x12;
 pub(crate) const MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION: u16 = 0x13;
+pub(crate) const MESSAGE_ID_SHUTDOWN_REQUEST: u16 = 0x0f;
+pub(crate) const MESSAGE_ID_SHUTDOWN_RESPONSE: u16 = 0x10;
 
 pub(crate) fn build_version_request_packet() -> Packet {
     Packet::new_from_parts(
@@ -103,5 +105,25 @@ pub(crate) fn build_channel_open_response(channel_id: u8, status: protos::Messag
         false,
         MESSAGE_ID_OPEN_CHANNEL_RESPONSE,
         &payload,
+    )
+}
+
+pub(crate) fn build_shutdown_request() -> Packet {
+    Packet::new_from_parts(
+        CHANNEL_ID_CONTROL,
+        AAPFrameType::ChannelSpecific,
+        false,
+        MESSAGE_ID_SHUTDOWN_REQUEST,
+        &[],
+    )
+}
+
+pub(crate) fn build_shutdown_response() -> Packet {
+    Packet::new_from_parts(
+        CHANNEL_ID_CONTROL,
+        AAPFrameType::ChannelSpecific,
+        false,
+        MESSAGE_ID_SHUTDOWN_RESPONSE,
+        &[],
     )
 }

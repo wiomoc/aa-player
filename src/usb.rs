@@ -25,7 +25,7 @@ use crate::frame::{AAPFrame, AAPFrameCodec, AsyncReader, AsyncWriter, FrameDecod
 
 pub struct UsbManager {
     incoming_queue_receiver: mpsc::Receiver<IncomingEvent>,
-    outgoing_queue_sender: mpsc::Sender<AAPFrame>,
+    outgoing_queue_sender: mpsc::Sender<OutgoingEvent>,
 }
 
 struct ConnectedDeviceState {
@@ -35,7 +35,7 @@ struct ConnectedDeviceState {
 
 struct UsbInternalState {
     incoming_queue_sender: mpsc::Sender<IncomingEvent>,
-    outgoing_queue_receiver: Arc<Mutex<mpsc::Receiver<AAPFrame>>>,
+    outgoing_queue_receiver: Arc<Mutex<mpsc::Receiver<OutgoingEvent>>>,
     connected_device: Option<ConnectedDeviceState>,
 }
 
@@ -45,11 +45,16 @@ pub(crate) enum IncomingEvent {
     Frame(AAPFrame),
 }
 
+pub(crate) enum OutgoingEvent {
+    Close,
+    Frame(AAPFrame),
+}
+
 //impl<C: FrameDecoder<UsbReader> + FrameEncoder<UsbWriter>> UsbManager {
 impl UsbManager {
     pub fn start(cancel_token: CancellationToken) -> Self {
         let (incoming_queue_sender, incoming_queue_receiver) = mpsc::channel::<IncomingEvent>(8);
-        let (outgoing_queue_sender, outgoing_queue_receiver) = mpsc::channel::<AAPFrame>(8);
+        let (outgoing_queue_sender, outgoing_queue_receiver) = mpsc::channel::<OutgoingEvent>(8);
 
         let state = UsbInternalState {
             incoming_queue_sender,
@@ -70,8 +75,14 @@ impl UsbManager {
     pub async fn send_frame(
         &self,
         frame: AAPFrame,
-    ) -> Result<(), mpsc::error::SendError<AAPFrame>> {
-        self.outgoing_queue_sender.send(frame).await
+    ) -> Result<(), mpsc::error::SendError<OutgoingEvent>> {
+        self.outgoing_queue_sender
+            .send(OutgoingEvent::Frame(frame))
+            .await
+    }
+
+    pub async fn send_connection_close(&self) -> Result<(), mpsc::error::SendError<OutgoingEvent>> {
+        self.outgoing_queue_sender.send(OutgoingEvent::Close).await
     }
 
     pub async fn recv_frame(&mut self) -> IncomingEvent {
@@ -98,9 +109,9 @@ impl UsbInternalState {
             let event = select! {
                 event = watch.next() => event,
                 _ = cancel_token.cancelled() => {
-                    if let Some(device_state) = self.connected_device.as_ref() {
-                        device_state.terminate_connection_token.cancel();
-                    }
+                    //if let Some(device_state) = self.connected_device.as_ref() {
+                    //    device_state.terminate_connection_token.cancel();
+                    //}
                     return;
                 }
             };
@@ -172,16 +183,21 @@ impl UsbInternalState {
                         endpoint.transfer_type() == EndpointType::Bulk
                             && endpoint.direction() == Direction::In
                     }) {
-                        alt_settings.endpoints().find(|endpoint| {
-                            endpoint.transfer_type() == EndpointType::Bulk
-                                && endpoint.direction() == Direction::Out
-                        }).map(|out_endpoint| (
-                                config.configuration_value(),
-                                interface.interface_number(),
-                                in_endpoint.address(),
-                                out_endpoint.address(),
-                                in_endpoint.max_packet_size(),
-                            ))
+                        alt_settings
+                            .endpoints()
+                            .find(|endpoint| {
+                                endpoint.transfer_type() == EndpointType::Bulk
+                                    && endpoint.direction() == Direction::Out
+                            })
+                            .map(|out_endpoint| {
+                                (
+                                    config.configuration_value(),
+                                    interface.interface_number(),
+                                    in_endpoint.address(),
+                                    out_endpoint.address(),
+                                    in_endpoint.max_packet_size(),
+                                )
+                            })
                     } else {
                         None
                     }
@@ -280,7 +296,7 @@ impl UsbInternalState {
     }
 
     async fn start_aoa_tx_loop(
-        outgoing_queue: Arc<Mutex<mpsc::Receiver<AAPFrame>>>,
+        outgoing_queue: Arc<Mutex<mpsc::Receiver<OutgoingEvent>>>,
         interface: Interface,
         endpoint: u8,
         packet_size: usize,
@@ -296,21 +312,28 @@ impl UsbInternalState {
         let mut outgoing_queue = outgoing_queue.lock().await;
 
         loop {
-            let frame: Option<AAPFrame> = select! {
+            let frame: Option<OutgoingEvent> = select! {
                 _ = terminate_connection_token.cancelled()  => { break; }
                 frame = outgoing_queue.recv() => frame
             };
-            if let Some(frame) = frame {
-                let result = codec.write_frame(frame, &mut writer).await;
+            match frame {
+                Some(OutgoingEvent::Frame(frame)) => {
+                    let mut result = codec.write_frame(frame, &mut writer).await;
 
-                if let Err(err) = result {
-                    error!("sending frame failed {err:?}");
-                    terminate_connection_token.cancel();
-                    break;
+                    if result.is_ok() && outgoing_queue.is_empty() {
+                        result = writer.flush_buffer().await;
+                    }
+
+                    if let Err(err) = result {
+                        error!("sending frame failed {err:?}");
+                        terminate_connection_token.cancel();
+                        break;
+                    }
                 }
-                writer.flush_buffer().await.unwrap();
-            } else {
-                break;
+                Some(OutgoingEvent::Close) => {
+                    terminate_connection_token.cancel();
+                }
+                None => break,
             }
         }
     }
