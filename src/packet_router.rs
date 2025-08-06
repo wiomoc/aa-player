@@ -31,7 +31,6 @@ enum PacketRouterConnectionState {
     WaitVersionResponse,
     Handshaking,
     Established { heartbeat: Heartbeater },
-    TearingDown { reason: PacketRouterTeardownReason },
 }
 
 #[derive(Clone, Copy)]
@@ -139,21 +138,27 @@ impl<'a> PacketRouter<'a> {
                 _ = cancel_token.cancelled() => return
             };
             if matches!(incoming_event, usb::IncomingEvent::Connected) {
-                let (outgoing_packet_queue_sender, mut outgoing_packet_queue_receiver) =
-                    mpsc::channel(2);
+                let (cancel_reason, mut outgoing_packet_queue_receiver) = {
+                    let (outgoing_packet_queue_sender, mut outgoing_packet_queue_receiver) =
+                        mpsc::channel(2);
+                    let mut router = PacketRouter {
+                        connection_state: PacketRouterConnectionState::WaitVersionResponse,
+                        framer: PacketFramer::new(encryption_manager.new_connection()),
+                        usb_manager: &mut usb_manager,
+                        services,
+                        outgoing_packet_queue_sender,
+                        channel_mapping: HashMap::new(),
+                    };
 
-                let mut router = PacketRouter {
-                    connection_state: PacketRouterConnectionState::WaitVersionResponse,
-                    framer: PacketFramer::new(encryption_manager.new_connection()),
-                    usb_manager: &mut usb_manager,
-                    services,
-                    outgoing_packet_queue_sender,
-                    channel_mapping: HashMap::new(),
+                    let cancel_reason = router
+                        .handle_connection(&mut outgoing_packet_queue_receiver, &cancel_token)
+                        .await;
+                    (cancel_reason, outgoing_packet_queue_receiver)
                 };
 
-                let cancel_reason = router
-                    .handle_connection(&mut outgoing_packet_queue_receiver, &cancel_token)
-                    .await;
+                //Wait until all services terminated
+                while outgoing_packet_queue_receiver.recv().await.is_some() {}
+
                 if matches!(
                     cancel_reason,
                     PacketRouterTeardownReason::ConnectionClosedExternaly
@@ -163,11 +168,12 @@ impl<'a> PacketRouter<'a> {
                 usb_manager.send_connection_close().await.unwrap();
 
                 if matches!(cancel_reason, PacketRouterTeardownReason::ClosingRouter) {
+                    usb_manager.close().await;
+                    error!("closed usb manager");
                     return;
                 }
             }
         }
-        //usb_manager.terminate();
     }
 
     async fn handle_connection(
@@ -199,8 +205,8 @@ impl<'a> PacketRouter<'a> {
                             usb::IncomingEvent::Connected => todo!(),
                             usb::IncomingEvent::Closed => return PacketRouterTeardownReason::ConnectionClosedExternaly,
                             usb::IncomingEvent::Frame(frame)  => {
-                                if self.process_incoming_frame(frame).await.is_err() {
-                                    return PacketRouterTeardownReason::ConnectionError;
+                                if let Err(reason) = self.process_incoming_frame(frame).await {
+                                    return reason;
                                 }
                             }
                         },
@@ -215,12 +221,11 @@ impl<'a> PacketRouter<'a> {
                             }
                         },
                         _ = cancel_token.cancelled() => {
-                            self.send_teardown().await;
+                            self.send_shutdown_request().await;
                             return PacketRouterTeardownReason::ClosingRouter;
                         }
                     }
                 }
-                PacketRouterConnectionState::TearingDown { reason } => return *reason,
                 _ => select! {
                     biased;
                     incoming_event = self.usb_manager.recv_frame() => match incoming_event {
@@ -229,13 +234,13 @@ impl<'a> PacketRouter<'a> {
                             return PacketRouterTeardownReason::ConnectionClosedExternaly;
                         }
                         usb::IncomingEvent::Frame(frame) => {
-                            if self.process_incoming_frame(frame).await.is_err() {
-                                return PacketRouterTeardownReason::ConnectionError;
+                            if let Err(reason) = self.process_incoming_frame(frame).await {
+                                return reason;
                             }
                         }
                     },
                     _ = cancel_token.cancelled() => {
-                        self.send_teardown().await;
+                        self.send_shutdown_request().await;
                         return PacketRouterTeardownReason::ClosingRouter;
                     }
                 },
@@ -243,63 +248,82 @@ impl<'a> PacketRouter<'a> {
         }
     }
 
-    async fn process_incoming_frame(&mut self, frame: AAPFrame) -> Result<(), ()> {
-        let packet = self.framer.process_incoming_frame(frame)?;
+    async fn process_incoming_frame(
+        &mut self,
+        frame: AAPFrame,
+    ) -> Result<(), PacketRouterTeardownReason> {
+        let packet = self
+            .framer
+            .process_incoming_frame(frame)
+            .map_err(|_| PacketRouterTeardownReason::ConnectionError)?;
         if let Some(packet) = packet {
             self.dispatch_incoming_packet(packet).await?;
         }
         Ok(())
     }
 
-    async fn dispatch_incoming_packet(&mut self, mut packet: Packet) -> Result<(), ()> {
+    async fn dispatch_incoming_packet(
+        &mut self,
+        mut packet: Packet,
+    ) -> Result<(), PacketRouterTeardownReason> {
         trace!("< {:?}", &packet);
         match &mut self.connection_state {
             PacketRouterConnectionState::WaitVersionResponse => {
                 assert!(packet.channel_id == CHANNEL_ID_CONTROL);
                 assert!(packet.message_id() == MESSAGE_ID_GET_VERSION_RESPONSE);
                 self.connection_state = PacketRouterConnectionState::Handshaking;
-                let handshake_message = self.framer.process_handshake_message(&mut [])?.unwrap();
+                let handshake_message = self
+                    .framer
+                    .process_handshake_message(&mut [])
+                    .map_err(|_| PacketRouterTeardownReason::ConnectionError)?
+                    .unwrap();
                 self.send_packet(build_handshake_packet(&handshake_message))
-                    .await?;
+                    .await
+                    .map_err(|_| PacketRouterTeardownReason::ConnectionError)?;
             }
             PacketRouterConnectionState::Handshaking => {
                 assert!(packet.channel_id == CHANNEL_ID_CONTROL);
                 assert!(packet.message_id() == MESSAGE_ID_HANDSHAKE);
                 if let Some(handshake_message) = self
                     .framer
-                    .process_handshake_message(packet.payload_mut())?
+                    .process_handshake_message(packet.payload_mut())
+                    .map_err(|_| PacketRouterTeardownReason::ConnectionError)?
                 {
                     self.send_packet(build_handshake_packet(&handshake_message))
-                        .await?;
+                        .await
+                        .map_err(|_| PacketRouterTeardownReason::ConnectionError)?;
                 } else if !self.framer.is_handshaking() {
                     let heartbeat = Heartbeater::start();
                     self.connection_state = PacketRouterConnectionState::Established { heartbeat };
                     info!("handshaking done");
-                    self.send_packet(build_auth_complete_packet()).await?;
+                    self.send_packet(build_auth_complete_packet())
+                        .await
+                        .map_err(|_| PacketRouterTeardownReason::ConnectionError)?;
                 }
             }
             PacketRouterConnectionState::Established { heartbeat } => {
                 heartbeat.restart_ping_countdown_timer();
                 let decode_packet_result = self.decode_packet(packet).await;
-                if decode_packet_result.is_err() {
-                    self.send_teardown().await;
-                }
-                return decode_packet_result;
-            }
-            PacketRouterConnectionState::TearingDown { .. } => {
-                info!("Ignoring incoming packet during teardown");
+                return match decode_packet_result {
+                    Ok(true) => Err(PacketRouterTeardownReason::ConnectionShutdownExternaly),
+                    Ok(false) => Ok(()),
+                    Err(_) => {
+                        self.send_shutdown_request().await;
+                        Err(PacketRouterTeardownReason::ConnectionError)
+                    }
+                };
             }
         }
         Ok(())
     }
 
-    async fn decode_packet(&mut self, packet: Packet) -> Result<(), ()> {
+    async fn decode_packet(&mut self, packet: Packet) -> Result<bool, ()> {
         if matches!(packet.r#type, AAPFrameType::Control)
             && packet.message_id() == MESSAGE_ID_OPEN_CHANNEL_REQUEST
         {
             self.handle_open_channel_request(packet).await?;
         } else if packet.channel_id == CHANNEL_ID_CONTROL {
-            self.handle_control_packet(packet).await?;
+            return self.handle_control_packet(packet).await;
         } else if let Some((_service_id, service_incoming_packet_queue)) =
             self.channel_mapping.get(&packet.channel_id)
         {
@@ -310,10 +334,11 @@ impl<'a> PacketRouter<'a> {
         } else {
             info!("received packet on unknown channel {}", packet.channel_id);
         }
-        Ok(())
+        Ok(false)
     }
 
-    async fn send_teardown(&mut self) {
+    async fn send_shutdown_request(&mut self) {
+        info!("Send shutdown");
         let _ = self.send_packet(build_shutdown_request()).await;
     }
 
@@ -375,7 +400,7 @@ impl<'a> PacketRouter<'a> {
         Ok(())
     }
 
-    async fn handle_control_packet(&mut self, packet: Packet) -> Result<(), ()> {
+    async fn handle_control_packet(&mut self, packet: Packet) -> Result<bool, ()> {
         match packet.message_id() {
             MESSAGE_ID_SERVICE_DISCOVERY_REQUEST => {
                 let service_discovery_request =
@@ -439,17 +464,16 @@ impl<'a> PacketRouter<'a> {
                 .await?;
             }
             MESSAGE_ID_SHUTDOWN_REQUEST => {
-                self.connection_state = PacketRouterConnectionState::TearingDown {
-                    reason: PacketRouterTeardownReason::ConnectionShutdownExternaly,
-                };
                 let _ = self.send_packet(build_shutdown_response()).await;
+                return Ok(true);
             }
             message_id => {
                 info!("received packet on control channel with unknown message_id {message_id}");
-                return Err(());
+                
+                //return Err(());
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn send_packet(&mut self, packet: Packet) -> Result<(), ()> {
@@ -461,6 +485,7 @@ impl<'a> PacketRouter<'a> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ChannelPacketSender {
     sender: Sender<Packet>,
     channel_id: u8,
@@ -480,5 +505,20 @@ impl ChannelPacketSender {
             payload,
         );
         self.sender.send(packet).await
+    }
+
+    pub(crate) fn blocking_send_proto(
+        &self,
+        message_id: u16,
+        payload: &impl Message,
+    ) -> Result<(), mpsc::error::SendError<Packet>> {
+        let packet = Packet::new_from_proto_message(
+            self.channel_id,
+            AAPFrameType::ChannelSpecific,
+            true,
+            message_id,
+            payload,
+        );
+        self.sender.blocking_send(packet)
     }
 }

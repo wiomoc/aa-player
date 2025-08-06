@@ -164,7 +164,10 @@ impl EncryptedConnectionManager {
     }
 
     pub(crate) fn decrypt_message(&mut self, encrypted_message: &mut [u8]) -> Result<Vec<u8>, ()> {
-        assert!(!self.is_handshaking);
+        if self.is_handshaking {
+            error!("trying to decrypt but handshaking not finshed");
+            return Err(());
+        }
 
         let mut position = 0usize;
         let mut message: Option<Vec<u8>> = None;

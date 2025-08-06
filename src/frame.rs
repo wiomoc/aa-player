@@ -90,7 +90,7 @@ impl<R: AsyncReader> FrameDecoder<R> for AAPFrameCodec {
             fragment_payload_length
         };
 
-        assert!(total_payload_length >= fragment_payload_length);
+        //assert!(total_payload_length >= fragment_payload_length);
 
         let encrypted = (flags & AAPFrameCodec::ENCRYPTED_PAYLOAD_MASK)
             == AAPFrameCodec::ENCRYPTED_PAYLOAD_MASK;

@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use byteorder::{BigEndian, ByteOrder};
-use log::{error, warn};
+use log::{error, info, warn};
 use prost::Message;
 
-use crate::{packet, packet_router, protos, service::Service};
+use crate::{
+    control_channel_packets::MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION, packet, packet_router, protos,
+    service::Service,
+};
 
 pub(crate) type TimestampMicros = u64;
 pub(crate) trait StreamRendererFactory {
@@ -17,12 +20,21 @@ pub(crate) trait StreamRendererFactory {
 }
 pub(crate) trait StreamRenderer {
     fn start(&mut self);
+
     fn stop(&mut self);
+
     fn add_content(
         &mut self,
         content: &[u8],
         timestamp: Option<TimestampMicros>,
     ) -> impl Future<Output = ()> + Send;
+
+    fn handle_video_focus_notification_request(
+        &mut self,
+        request: protos::VideoFocusRequestNotification,
+    ) -> Result<protos::VideoFocusNotification, ()> {
+        return Err(());
+    }
 }
 
 pub(crate) struct MediaService<P: StreamRendererFactory + Send + Sync> {
@@ -39,6 +51,8 @@ impl<P: StreamRendererFactory + Send + Sync> MediaService<P> {
     const MESSAGE_ID_STOP: u16 = 0x8002;
     const MESSAGE_ID_CONFIG: u16 = 0x8003;
     const MESSAGE_ID_ACK: u16 = 0x8004;
+    const MESSAGE_ID_VIDEO_FOCUS_REQUEST_NOTIFICATION: u16 = 0x8007;
+    const MESSAGE_ID_VIDEO_FOCUS_NOTIFICATION: u16 = 0x8008;
 
     const MAX_UNACKED_CONTENT_MESSAGES: usize = 20;
     const SEND_ACK_AFTER_CONTENT_MESSAGES: usize = Self::MAX_UNACKED_CONTENT_MESSAGES - 5;
@@ -62,16 +76,22 @@ impl<P: StreamRendererFactory + Send + Sync> MediaService<P> {
         let mut unacked_content_messages = Vec::new();
         while let Some(packet) = packet_receiver.recv().await {
             match packet.message_id() {
-                Self::MESSAGE_ID_TIMESTAMPED_CONTENT => {
+                message_id @ (Self::MESSAGE_ID_TIMESTAMPED_CONTENT | Self::MESSAGE_ID_CONTENT) => {
                     let session_id = session_id.ok_or(()).map_err(|_| warn!("Not started yet"))?;
                     let renderer = renderer
                         .as_mut()
                         .ok_or(())
                         .map_err(|_| warn!("Not setuped yet"))?;
-                    let timestamp_micros = BigEndian::read_u64(packet.payload());
-                    let content = &packet.payload()[8..];
-                    renderer.add_content(content, Some(timestamp_micros)).await;
-                    unacked_content_messages.push(timestamp_micros);
+                    let (content, timestamp) = if message_id == Self::MESSAGE_ID_TIMESTAMPED_CONTENT
+                    {
+                        let timestamp_micros = BigEndian::read_u64(packet.payload());
+                        unacked_content_messages.push(timestamp_micros);
+
+                        (&packet.payload()[8..], Some(timestamp_micros))
+                    } else {
+                        (packet.payload(), None)
+                    };
+                    renderer.add_content(content, timestamp).await;
                     if unacked_content_messages.len() >= Self::MAX_UNACKED_CONTENT_MESSAGES - 1 {
                         packet_sender
                             .send_proto(
@@ -94,6 +114,7 @@ impl<P: StreamRendererFactory + Send + Sync> MediaService<P> {
                         config.r#type(),
                         renderer_factory.get_descriptor(&spec).available_type()
                     );
+                    info!("received setup {:?}", &config);
                     renderer = renderer_factory.create(&spec).ok();
                     packet_sender
                         .send_proto(
@@ -129,6 +150,24 @@ impl<P: StreamRendererFactory + Send + Sync> MediaService<P> {
                         .ok_or(())
                         .map_err(|_| warn!("Not setuped yet"))?;
                     renderer.stop();
+                }
+                Self::MESSAGE_ID_VIDEO_FOCUS_REQUEST_NOTIFICATION => {
+                    let renderer = renderer.as_mut().unwrap();
+
+                    let request_notification = protos::VideoFocusRequestNotification::decode(
+                        packet.payload(),
+                    )
+                    .map_err(|err| {
+                        warn!("could not decode video focus request notification {err:?}")
+                    })?;
+                    let notification =
+                        renderer.handle_video_focus_notification_request(request_notification)?;
+                    info!("received vide focus {:?}", &notification);
+
+                    packet_sender
+                        .send_proto(Self::MESSAGE_ID_VIDEO_FOCUS_NOTIFICATION, &notification)
+                        .await
+                        .unwrap();
                 }
                 _ => warn!("Received packet with unknown message id {packet:?}"),
             }

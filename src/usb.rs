@@ -12,12 +12,11 @@ use nusb::{
     hotplug::HotplugEvent,
     transfer::{
         ControlIn, ControlOut, ControlType, Direction, EndpointType, Recipient, RequestBuffer,
+        TransferError,
     },
 };
 use tokio::{
-    select,
-    sync::{Mutex, mpsc},
-    time,
+    select, sync::{mpsc, Mutex}, task::JoinHandle, time
 };
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +25,8 @@ use crate::frame::{AAPFrame, AAPFrameCodec, AsyncReader, AsyncWriter, FrameDecod
 pub struct UsbManager {
     incoming_queue_receiver: mpsc::Receiver<IncomingEvent>,
     outgoing_queue_sender: mpsc::Sender<OutgoingEvent>,
+    join_handle: JoinHandle<()>,
+    cancel_token: CancellationToken
 }
 
 struct ConnectedDeviceState {
@@ -37,6 +38,8 @@ struct UsbInternalState {
     incoming_queue_sender: mpsc::Sender<IncomingEvent>,
     outgoing_queue_receiver: Arc<Mutex<mpsc::Receiver<OutgoingEvent>>>,
     connected_device: Option<ConnectedDeviceState>,
+    rx_loop_join_handle: Option<JoinHandle<()>>,
+    tx_loop_join_handle: Option<JoinHandle<()>>
 }
 
 pub(crate) enum IncomingEvent {
@@ -52,7 +55,8 @@ pub(crate) enum OutgoingEvent {
 
 //impl<C: FrameDecoder<UsbReader> + FrameEncoder<UsbWriter>> UsbManager {
 impl UsbManager {
-    pub fn start(cancel_token: CancellationToken) -> Self {
+    pub fn start() -> Self {
+        let cancel_token =  CancellationToken::new();
         let (incoming_queue_sender, incoming_queue_receiver) = mpsc::channel::<IncomingEvent>(8);
         let (outgoing_queue_sender, outgoing_queue_receiver) = mpsc::channel::<OutgoingEvent>(8);
 
@@ -60,14 +64,18 @@ impl UsbManager {
             incoming_queue_sender,
             outgoing_queue_receiver: Arc::new(Mutex::new(outgoing_queue_receiver)),
             connected_device: None,
+            rx_loop_join_handle: None,
+            tx_loop_join_handle: None
         };
+
+        let join_handle = tokio::spawn(state.start_device_handle_loop(cancel_token.clone()));
 
         let usb_manager = UsbManager {
             incoming_queue_receiver,
             outgoing_queue_sender,
+            cancel_token,
+            join_handle
         };
-
-        tokio::spawn(state.start_device_handle_loop(cancel_token));
 
         usb_manager
     }
@@ -91,6 +99,11 @@ impl UsbManager {
             .await
             .unwrap_or(IncomingEvent::Closed)
     }
+
+    pub async fn close(self) {
+        self.cancel_token.cancel();;
+        self.join_handle.await.unwrap();
+    }
 }
 
 impl UsbInternalState {
@@ -109,10 +122,7 @@ impl UsbInternalState {
             let event = select! {
                 event = watch.next() => event,
                 _ = cancel_token.cancelled() => {
-                    //if let Some(device_state) = self.connected_device.as_ref() {
-                    //    device_state.terminate_connection_token.cancel();
-                    //}
-                    return;
+                    break;
                 }
             };
 
@@ -124,9 +134,16 @@ impl UsbInternalState {
                     self.handle_disconnected_device(device_id).await;
                 }
                 None => {
-                    return;
+                    break;
                 }
             }
+        }
+        if let Some(rx_loop_join_handle) =  self.rx_loop_join_handle {
+            rx_loop_join_handle.await.unwrap();
+        }
+
+        if let Some(tx_loop_join_handle) =  self.tx_loop_join_handle {
+            tx_loop_join_handle.await.unwrap();
         }
     }
 
@@ -232,20 +249,20 @@ impl UsbInternalState {
                     outgoing_queue_receiver.try_recv().unwrap();
                 }
             }
-            tokio::spawn(Self::start_aoa_rx_loop(
+            self.rx_loop_join_handle = Some(tokio::spawn(Self::start_aoa_rx_loop(
                 self.incoming_queue_sender.clone(),
                 interface.clone(),
                 in_endpoint_address,
                 max_packet_size,
                 terminate_connection_token.clone(),
-            ));
-            tokio::spawn(Self::start_aoa_tx_loop(
+            )));
+            self.tx_loop_join_handle = Some(tokio::spawn(Self::start_aoa_tx_loop(
                 self.outgoing_queue_receiver.clone(),
                 interface.clone(),
                 out_endpoint_address,
                 max_packet_size,
                 terminate_connection_token.clone(),
-            ));
+            )));
         }
 
         Ok(())
@@ -280,8 +297,10 @@ impl UsbInternalState {
             let result = codec.read_frame(&mut reader).await;
             match result {
                 Err(err) => {
-                    error!("receiving frame failed {err:?}");
-                    terminate_connection_token.cancel();
+                    if !terminate_connection_token.is_cancelled() {
+                        error!("receiving frame failed {err:?}");
+                        terminate_connection_token.cancel();
+                    }
                     incoming_queue.send(IncomingEvent::Closed).await.unwrap();
                     return;
                 }
@@ -320,7 +339,9 @@ impl UsbInternalState {
                 Some(OutgoingEvent::Frame(frame)) => {
                     let mut result = codec.write_frame(frame, &mut writer).await;
 
-                    if result.is_ok() && outgoing_queue.is_empty() {
+                    if result.is_ok()
+                    /*&& outgoing_queue.is_empty()*/
+                    {
                         result = writer.flush_buffer().await;
                     }
 

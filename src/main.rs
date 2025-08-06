@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use byteorder::{BigEndian, ByteOrder};
-use log::{debug, info};
+use log::{debug, error, info};
 use prost::Message;
 use simple_logger::SimpleLogger;
-use tokio::{fs::File, io::AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -15,6 +14,7 @@ use crate::{
         Service,
         audio_renderer::{AudioStreamRendererFactory, AudioStreamSpec},
         media_sink::MediaService,
+        video_renderer::{InputService, VideoStreamRendererFactory},
     },
     usb::UsbManager,
 };
@@ -41,11 +41,22 @@ async fn main() -> Result<(), ()> {
     info!("starting");
     let cancel_token = CancellationToken::new();
 
-    let usb_manager = UsbManager::start(cancel_token.clone());
+    let usb_manager = UsbManager::start();
     let audio_stream_renderer_factory = Arc::new(AudioStreamRendererFactory::new());
+    let cancel_token_cloned = cancel_token.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8];
+        while &buf != b"c" {
+            tokio::io::stdin().read_exact(&mut buf).await.unwrap();
+        }
+
+        cancel_token_cloned.cancel();
+        error!("control-c");
+    });
+
     PacketRouter::start(
         usb_manager,
-        cancel_token.clone(),
+        cancel_token,
         &[
             StubService::new(protos::Service {
                 id: 1,
@@ -57,41 +68,12 @@ async fn main() -> Result<(), ()> {
                 }),
                 ..Default::default()
             }),
-            StubService::new(protos::Service {
-                id: 2,
-                media_sink_service: Some(protos::MediaSinkService {
-                    available_type: Some(protos::MediaCodecType::MediaCodecVideoH264Bp as i32),
-                    video_configs: vec![protos::VideoConfiguration {
-                        codec_resolution: Some(
-                            protos::VideoCodecResolutionType::Video1280x720 as i32,
-                        ),
-                        frame_rate: Some(protos::VideoFrameRateType::VideoFps60 as i32),
-                        width_margin: Some(0),
-                        height_margin: Some(0),
-                        density: Some(300),
-                        video_codec_type: Some(
-                            protos::MediaCodecType::MediaCodecVideoH264Bp as i32,
-                        ),
-                        ..Default::default()
-                    }],
-                    available_while_in_call: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            StubService::new(protos::Service {
-                id: 3,
-                input_source_service: Some(protos::InputSourceService {
-                    touchscreen: vec![protos::input_source_service::TouchScreen {
-                        width: 1280,
-                        height: 720,
-                        r#type: Some(protos::TouchScreenType::Capacitive as i32),
-                        is_secondary: Some(false),
-                    }],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+            Box::new(MediaService::new(
+                2,
+                Arc::new(VideoStreamRendererFactory::new()),
+                (),
+            )),
+            Box::new(InputService::new()),
             StubService::new(protos::Service {
                 id: 4,
                 media_sink_service: Some(protos::MediaSinkService {
@@ -118,13 +100,13 @@ async fn main() -> Result<(), ()> {
                     stream_type: protos::AudioStreamType::AudioStreamMedia,
                 },
             )),
-            Box::new(MediaService::new(
+            /*Box::new(MediaService::new(
                 6,
                 audio_stream_renderer_factory.clone(),
                 AudioStreamSpec {
                     sampling_rate: 16000,
                     channels: 1,
-                    sampling_depth_bits: 16,
+                    sampling_depth_bits: 8,
                     stream_type: protos::AudioStreamType::AudioStreamTelephony,
                 },
             )),
@@ -147,9 +129,9 @@ async fn main() -> Result<(), ()> {
                     sampling_depth_bits: 16,
                     stream_type: protos::AudioStreamType::AudioStreamSystemAudio,
                 },
-            )),
+            )),*/
             StubService::new(protos::Service {
-                id: 8,
+                id: 9,
                 media_source_service: Some(protos::MediaSourceService {
                     available_type: Some(protos::MediaCodecType::MediaCodecAudioPcm as i32),
                     audio_config: Some(protos::AudioConfiguration {
@@ -164,11 +146,8 @@ async fn main() -> Result<(), ()> {
         ],
     )
     .await;
+    error!("end");
 
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.unwrap();
-        cancel_token.cancel();
-    });
     Ok(())
 }
 
@@ -197,34 +176,8 @@ impl Service for StubService {
     ) {
         let service_id = self.descriptor.id;
         tokio::spawn(async move {
-            let mut stream_file = File::create("stream.h264").await.unwrap();
             while let Some(packet) = packet_receiver.recv().await {
                 match packet.message_id() {
-                    0x0000 => {
-                        if service_id == 2 {
-                            stream_file.write_all(&packet.payload()[8..]).await.unwrap();
-                            stream_file.flush().await.unwrap();
-                            packet_sender
-                                .send_proto(
-                                    0x8004,
-                                    &protos::Ack {
-                                        ack: Some(1),
-                                        receive_timestamp_ns: vec![BigEndian::read_u64(
-                                            packet.payload(),
-                                        )],
-                                        session_id: 1,
-                                    },
-                                )
-                                .await
-                                .unwrap();
-                        }
-                    }
-                    0x0001 => {
-                        if service_id == 2 {
-                            stream_file.write_all(packet.payload()).await.unwrap();
-                            stream_file.flush().await.unwrap();
-                        }
-                    }
                     0x8002 => {
                         debug!(
                             "service {} received packet {:?}",
@@ -233,42 +186,6 @@ impl Service for StubService {
                         );
                         packet_sender
                             .send_proto(0x8003, &protos::KeyBindingResponse { status: 0 })
-                            .await
-                            .unwrap();
-                    }
-                    0x8000 => {
-                        debug!(
-                            "service {} received packet {:?}",
-                            service_id,
-                            protos::Setup::decode(packet.payload()).unwrap()
-                        );
-                        //packet_sender
-                        //    .send_proto(
-                        //        0x8003,
-                        //        &protos::Config {
-                        //            status: protos::config::Status::Wait as i32,
-                        //            configuration_indices: vec![0],
-                        //            max_unacked: Some(1),
-                        //        },
-                        //    )
-                        //    .await
-                        //    .unwrap();
-                    }
-                    0x8007 => {
-                        debug!(
-                            "service {} received packet {:?}",
-                            service_id,
-                            protos::VideoFocusRequestNotification::decode(packet.payload())
-                                .unwrap()
-                        );
-                        packet_sender
-                            .send_proto(
-                                0x8008,
-                                &protos::VideoFocusNotification {
-                                    focus: Some(protos::VideoFocusMode::VideoFocusProjected as i32),
-                                    ..Default::default()
-                                },
-                            )
                             .await
                             .unwrap();
                     }

@@ -2,7 +2,9 @@ use tokio::sync::mpsc;
 
 use crate::{packet::Packet, packet_router::ChannelPacketSender, protos};
 pub(crate) mod audio_renderer;
+pub(crate) mod video_renderer;
 pub(crate) mod media_sink;
+mod gst_custom_app_src;
 
 pub(crate) trait Service {
     fn get_id(&self) -> i32 {
