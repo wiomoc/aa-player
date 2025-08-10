@@ -1,21 +1,18 @@
+use glib::{GStr, object::ObjectExt};
 use gstreamer::{
-    Caps, ClockTime,
+    Caps,
     glib::object::Cast,
     prelude::{ElementExt, GstBinExtManual},
 };
 use gstreamer_app::AppSrc;
-use lazy_static::lazy_static;
-use log::{debug, error, info};
-use prost::Message;
-use std::{fs::File, io::Write, sync::Arc, thread};
-use tokio::sync::Mutex;
+use log::{error, info};
+use std::{thread};
 
 use crate::{
-    packet_router::ChannelPacketSender,
     protos,
     service::{
-        Service,
-        gst_custom_app_src::CustomAppSrc,
+        gst_input_event_tap::InputEventTap,
+        input_service::InputEventReceiver,
         media_sink::{StreamRenderer, StreamRendererFactory},
     },
 };
@@ -28,112 +25,83 @@ impl VideoStreamRendererFactory {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct VideoSpec {
+    pub(crate) resolution: protos::VideoCodecResolutionType,
+    pub(crate) frame_rate: protos::VideoFrameRateType,
+    pub(crate) dpi: u32,
+    pub(crate) input_event_receiver: InputEventReceiver,
+}
+
+impl VideoSpec {
+    fn size(&self) -> (u32, u32) {
+        match self.resolution {
+            protos::VideoCodecResolutionType::Video800x480 => (800, 400),
+            protos::VideoCodecResolutionType::Video1280x720 => (1280, 720),
+            protos::VideoCodecResolutionType::Video1920x1080 => (1920, 1080),
+            protos::VideoCodecResolutionType::Video2560x1440 => (2560, 1440),
+            protos::VideoCodecResolutionType::Video3840x2160 => (3840, 2160),
+            protos::VideoCodecResolutionType::Video720x1280 => (720, 1280),
+            protos::VideoCodecResolutionType::Video1080x1920 => (1080, 1920),
+            protos::VideoCodecResolutionType::Video1440x2560 => (1440, 2560),
+            protos::VideoCodecResolutionType::Video2160x3840 => (2160, 3840),
+        }
+    }
+
+    fn fps(&self) -> u8 {
+        match self.frame_rate {
+            protos::VideoFrameRateType::VideoFps60 => 60,
+            protos::VideoFrameRateType::VideoFps30 => 30,
+        }
+    }
+}
+
 impl StreamRendererFactory for VideoStreamRendererFactory {
     type Renderer = VideoStreamRenderer;
-    type Spec = ();
+    type Spec = VideoSpec;
 
     fn get_descriptor(&self, spec: &Self::Spec) -> crate::protos::MediaSinkService {
-        return protos::MediaSinkService {
+        protos::MediaSinkService {
             available_type: Some(protos::MediaCodecType::MediaCodecVideoH264Bp as i32),
             video_configs: vec![protos::VideoConfiguration {
-                codec_resolution: Some(protos::VideoCodecResolutionType::Video1280x720 as i32),
-                frame_rate: Some(protos::VideoFrameRateType::VideoFps60 as i32),
+                codec_resolution: Some(spec.resolution as i32),
+                frame_rate: Some(spec.frame_rate as i32),
                 width_margin: Some(0),
                 height_margin: Some(0),
-                density: Some(300),
+                density: Some(spec.dpi),
                 video_codec_type: Some(protos::MediaCodecType::MediaCodecVideoH264Bp as i32),
                 ..Default::default()
             }],
             available_while_in_call: Some(true),
             ..Default::default()
-        };
-    }
-
-    fn create(&self, spec: &Self::Spec) -> Result<Self::Renderer, ()> {
-        Ok(VideoStreamRenderer::new())
-    }
-}
-
-lazy_static! {
-    pub(crate) static ref PACKET_SENDER: Arc<Mutex<Option<ChannelPacketSender>>> =
-        Arc::new(Mutex::new(None));
-}
-pub(crate) struct InputService {}
-
-impl InputService {
-    pub(crate) fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Service for InputService {
-    fn get_descriptor(&self) -> protos::Service {
-        protos::Service {
-            id: 3,
-            input_source_service: Some(protos::InputSourceService {
-                touchscreen: vec![protos::input_source_service::TouchScreen {
-                    width: 1280,
-                    height: 720,
-                    r#type: Some(protos::TouchScreenType::Capacitive as i32),
-                    is_secondary: Some(false),
-                }],
-                ..Default::default()
-            }),
-            ..Default::default()
         }
     }
 
-    fn instanciate(
-        &self,
-        packet_sender: ChannelPacketSender,
-        mut packet_receiver: tokio::sync::mpsc::Receiver<crate::packet::Packet>,
-    ) {
-        tokio::spawn(async move {
-            {
-                *PACKET_SENDER.lock().await = Some(packet_sender.clone());
-            }
-            while let Some(packet) = packet_receiver.recv().await {
-                match packet.message_id() {
-                    0x8002 => {
-                        debug!(
-                            "service received packet {:?}",
-                            protos::KeyBindingRequest::decode(packet.payload()).unwrap()
-                        );
-                        packet_sender
-                            .send_proto(0x8003, &protos::KeyBindingResponse { status: 0 })
-                            .await
-                            .unwrap();
-                    }
-                    message_id => debug!("service received packet {message_id}"),
-                }
-            }
-        });
+    fn create(&self, spec: &Self::Spec) -> Result<Self::Renderer, ()> {
+        Ok(VideoStreamRenderer::new(spec))
     }
 }
 
 pub(crate) struct VideoStreamRenderer {
-    file: File,
     appsrc: AppSrc,
     pipeline: gstreamer::Pipeline,
 }
 
 impl VideoStreamRenderer {
-    fn new() -> Self {
+    fn new(spec: &VideoSpec) -> Self {
         gstreamer::init().unwrap();
 
         let pipeline: gstreamer::Pipeline = gstreamer::Pipeline::default();
 
+        let size = spec.size();
         let appsrc_caps = Caps::builder("video/x-h264")
             .field("stream-format", "byte-stream")
             .field("alignment", "au")
-            .field("height", 720)
-            .field("width", 1280)
+            .field("width", size.0 as i32)
+            .field("height", size.1 as i32)
             .field("profile", "main")
+            //.field("framerate", gstreamer::Fraction::new(1, spec.fps() as i32))
             .build();
-        //let structure = appsrc_caps.get_mut().unwrap().structure_mut(0).unwrap();
-        //structure.set("stream-format", "byte-stream");
-        //structure.set("alignment", "au");
-        //info!("struct {:?}", &structure);
 
         let appsrc = gstreamer_app::AppSrc::builder()
             .caps(&appsrc_caps)
@@ -142,11 +110,24 @@ impl VideoStreamRenderer {
             .format(gstreamer::Format::Buffers)
             .build();
 
-        let h264parse = gstreamer::ElementFactory::make("h264parse")
-            .build()
-            .unwrap();
-
-        let event_interceptor = CustomAppSrc::new();
+        let input_event_receiver = spec.input_event_receiver.clone();
+        let event_interceptor = InputEventTap::new();
+        event_interceptor.connect("input-event", false, move |args| {
+            let event: gstreamer::Event = args[1].get().unwrap();
+            if let Some(structure) = event.structure() {
+                let event_name: &GStr = structure.get("event").unwrap();
+                let action = match event_name.as_str() {
+                    "mouse-move" => protos::PointerAction::ActionMoved,
+                    "mouse-button-release" => protos::PointerAction::ActionUp,
+                    "mouse-button-press" => protos::PointerAction::ActionDown,
+                    _ => return None,
+                };
+                let pointer_x = structure.get::<'_, f64>("pointer_x").unwrap() as u32;
+                let pointer_y = structure.get::<'_, f64>("pointer_y").unwrap() as u32;
+                input_event_receiver.report_touch_event(action, (pointer_x, pointer_y));
+            }
+            None
+        });
 
         let d3d11h264dec = gstreamer::ElementFactory::make("d3d11h264dec")
             .build()
@@ -155,19 +136,10 @@ impl VideoStreamRenderer {
             .build()
             .unwrap();
 
-        //d3dvideosink.connect_closure(
-        //    "mouse-event",
-        //    false,
-        //    glib::RustClosure::new(|values| {
-        //        info!("moved {:?}", values);
-        //        None
-        //    }),
-        //);
         pipeline
             .add_many([
                 appsrc.upcast_ref(),
                 event_interceptor.upcast_ref(),
-                // &h264parse,
                 &d3d11h264dec,
                 &d3dvideosink,
             ])
@@ -176,13 +148,11 @@ impl VideoStreamRenderer {
         gstreamer::Element::link_many([
             appsrc.upcast_ref(),
             event_interceptor.upcast_ref(),
-            //&h264parse,
             &d3d11h264dec,
             &d3dvideosink,
         ])
         .unwrap();
         Self {
-            file: File::create("stream.h264").unwrap(),
             pipeline,
             appsrc,
         }
@@ -223,8 +193,6 @@ impl StreamRenderer for VideoStreamRenderer {
         content: &[u8],
         timestamp: Option<super::media_sink::TimestampMicros>,
     ) {
-        self.file.write_all(content).unwrap();
-
         let mut buffer = gstreamer::Buffer::with_size(content.len()).unwrap();
         //buffer
         //    .get_mut()
@@ -240,11 +208,11 @@ impl StreamRenderer for VideoStreamRenderer {
 
     fn handle_video_focus_notification_request(
         &mut self,
-        request: protos::VideoFocusRequestNotification,
+        _request: protos::VideoFocusRequestNotification,
     ) -> Result<protos::VideoFocusNotification, ()> {
-        return Ok(protos::VideoFocusNotification {
+        Ok(protos::VideoFocusNotification {
             focus: Some(protos::VideoFocusMode::VideoFocusProjected as i32),
             ..Default::default()
-        });
+        })
     }
 }

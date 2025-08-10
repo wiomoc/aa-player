@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ByteOrder};
-use log::trace;
+use log::{error, trace};
 use prost::Message;
 
 use crate::{
@@ -171,15 +171,28 @@ impl PacketFramer {
 
         let defragmented_frame = match frame.frag_info {
             AAPFrameFragmmentation::First => {
-                assert!(self.pending_frame.is_none());
+                if self.pending_frame.is_some() {
+                    error!("continuation not finished yet");
+                    return Err(());
+                }
+
                 self.pending_frame = Some(frame);
                 return Ok(None);
             }
             AAPFrameFragmmentation::Continuation | AAPFrameFragmmentation::Last => {
-                let mut pending_frame = self.pending_frame.take().expect("pending frame missing");
-                assert!(pending_frame.channel_id == frame.channel_id);
-                assert!(pending_frame.encrypted == frame.encrypted);
-                assert!(pending_frame.r#type == frame.r#type);
+                let mut pending_frame = self
+                    .pending_frame
+                    .take()
+                    .ok_or(())
+                    .map_err(|_| error!("pending frame missing"))?;
+
+                if pending_frame.channel_id != frame.channel_id
+                    || pending_frame.encrypted != frame.encrypted
+                    || pending_frame.r#type != frame.r#type
+                {
+                    error!("invalid continuation");
+                    return Err(());
+                }
 
                 pending_frame.payload.extend_from_slice(&frame.payload);
                 if matches!(frame.frag_info, AAPFrameFragmmentation::Continuation) {

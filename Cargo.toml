@@ -17,10 +17,7 @@ prost = "0.14.1"
 cpal = "0.16.0"
 gstreamer = "0.24.0"
 gstreamer-app = "0.24.0"
-gstreamer-video = "0.24.0"
-gstreamer-base = "0.24.0"
-glib="0.21.0"
-lazy_static = "1.5.0"
+glib = "0.21.0"
 
 [patch.crates-io]
 rustls-webpki = {git = "https://github.com/uglyoldbob/webpki.git"}

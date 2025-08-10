@@ -4,7 +4,7 @@ use log::{error, info, trace, warn};
 use prost::Message;
 use tokio::{
     select,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, WeakSender},
     time::{self, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -140,7 +140,7 @@ impl<'a> PacketRouter<'a> {
             if matches!(incoming_event, usb::IncomingEvent::Connected) {
                 let (cancel_reason, mut outgoing_packet_queue_receiver) = {
                     let (outgoing_packet_queue_sender, mut outgoing_packet_queue_receiver) =
-                        mpsc::channel(2);
+                        mpsc::channel(8);
                     let mut router = PacketRouter {
                         connection_state: PacketRouterConnectionState::WaitVersionResponse,
                         framer: PacketFramer::new(encryption_manager.new_connection()),
@@ -269,8 +269,12 @@ impl<'a> PacketRouter<'a> {
         trace!("< {:?}", &packet);
         match &mut self.connection_state {
             PacketRouterConnectionState::WaitVersionResponse => {
-                assert!(packet.channel_id == CHANNEL_ID_CONTROL);
-                assert!(packet.message_id() == MESSAGE_ID_GET_VERSION_RESPONSE);
+                if packet.channel_id != CHANNEL_ID_CONTROL
+                    || packet.message_id() != MESSAGE_ID_GET_VERSION_RESPONSE
+                {
+                    error!("Expected get version reponse packet");
+                    return Err(PacketRouterTeardownReason::ConnectionError);
+                }
                 self.connection_state = PacketRouterConnectionState::Handshaking;
                 let handshake_message = self
                     .framer
@@ -282,8 +286,12 @@ impl<'a> PacketRouter<'a> {
                     .map_err(|_| PacketRouterTeardownReason::ConnectionError)?;
             }
             PacketRouterConnectionState::Handshaking => {
-                assert!(packet.channel_id == CHANNEL_ID_CONTROL);
-                assert!(packet.message_id() == MESSAGE_ID_HANDSHAKE);
+                if packet.channel_id != CHANNEL_ID_CONTROL
+                    || packet.message_id() != MESSAGE_ID_HANDSHAKE
+                {
+                    error!("Expected handshake packet");
+                    return Err(PacketRouterTeardownReason::ConnectionError);
+                }
                 if let Some(handshake_message) = self
                     .framer
                     .process_handshake_message(packet.payload_mut())
@@ -452,10 +460,6 @@ impl<'a> PacketRouter<'a> {
                 }
             }
             MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION_REQUEST => {
-                assert!(matches!(
-                    self.connection_state,
-                    PacketRouterConnectionState::Established { .. }
-                ));
                 let _request = protos::AudioFocusRequestNotification::decode(packet.payload())
                     .map_err(|_| error!("couldn't decode audio focus request"))?;
                 self.send_packet(build_focus_notification_packet(
@@ -469,7 +473,7 @@ impl<'a> PacketRouter<'a> {
             }
             message_id => {
                 info!("received packet on control channel with unknown message_id {message_id}");
-                
+
                 //return Err(());
             }
         }
@@ -486,12 +490,46 @@ impl<'a> PacketRouter<'a> {
 }
 
 #[derive(Clone)]
+pub(crate) struct WeakChannelPacketSender {
+    sender: WeakSender<Packet>,
+    channel_id: u8,
+}
+
+impl WeakChannelPacketSender {
+    pub(crate) fn blocking_send_proto(
+        &self,
+        message_id: u16,
+        payload: &impl Message,
+    ) -> Result<Option<()>, mpsc::error::SendError<Packet>> {
+        self.sender
+            .upgrade()
+            .map(|sender| {
+                let packet = Packet::new_from_proto_message(
+                    self.channel_id,
+                    AAPFrameType::ChannelSpecific,
+                    true,
+                    message_id,
+                    payload,
+                );
+                sender.blocking_send(packet)
+            })
+            .transpose()
+    }
+}
+
 pub(crate) struct ChannelPacketSender {
     sender: Sender<Packet>,
     channel_id: u8,
 }
 
 impl ChannelPacketSender {
+    pub(crate) fn downgrade(&self) -> WeakChannelPacketSender {
+        WeakChannelPacketSender {
+            sender: self.sender.downgrade(),
+            channel_id: self.channel_id,
+        }
+    }
+
     pub(crate) async fn send_proto(
         &self,
         message_id: u16,
@@ -505,20 +543,5 @@ impl ChannelPacketSender {
             payload,
         );
         self.sender.send(packet).await
-    }
-
-    pub(crate) fn blocking_send_proto(
-        &self,
-        message_id: u16,
-        payload: &impl Message,
-    ) -> Result<(), mpsc::error::SendError<Packet>> {
-        let packet = Packet::new_from_proto_message(
-            self.channel_id,
-            AAPFrameType::ChannelSpecific,
-            true,
-            message_id,
-            payload,
-        );
-        self.sender.blocking_send(packet)
     }
 }

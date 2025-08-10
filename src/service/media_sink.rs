@@ -5,7 +5,7 @@ use log::{error, info, warn};
 use prost::Message;
 
 use crate::{
-    control_channel_packets::MESSAGE_ID_AUDIO_FOCUS_NOTIFICATION, packet, packet_router, protos,
+    packet, packet_router, protos,
     service::Service,
 };
 
@@ -31,9 +31,9 @@ pub(crate) trait StreamRenderer {
 
     fn handle_video_focus_notification_request(
         &mut self,
-        request: protos::VideoFocusRequestNotification,
+        _request: protos::VideoFocusRequestNotification,
     ) -> Result<protos::VideoFocusNotification, ()> {
-        return Err(());
+        Err(())
     }
 }
 

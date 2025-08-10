@@ -12,7 +12,6 @@ use nusb::{
     hotplug::HotplugEvent,
     transfer::{
         ControlIn, ControlOut, ControlType, Direction, EndpointType, Recipient, RequestBuffer,
-        TransferError,
     },
 };
 use tokio::{
@@ -70,14 +69,14 @@ impl UsbManager {
 
         let join_handle = tokio::spawn(state.start_device_handle_loop(cancel_token.clone()));
 
-        let usb_manager = UsbManager {
+        
+
+        UsbManager {
             incoming_queue_receiver,
             outgoing_queue_sender,
             cancel_token,
             join_handle
-        };
-
-        usb_manager
+        }
     }
 
     pub async fn send_frame(
@@ -101,7 +100,7 @@ impl UsbManager {
     }
 
     pub async fn close(self) {
-        self.cancel_token.cancel();;
+        self.cancel_token.cancel();
         self.join_handle.await.unwrap();
     }
 }

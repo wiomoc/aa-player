@@ -11,10 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     packet_router::PacketRouter,
     service::{
-        Service,
-        audio_renderer::{AudioStreamRendererFactory, AudioStreamSpec},
-        media_sink::MediaService,
-        video_renderer::{InputService, VideoStreamRendererFactory},
+        audio_renderer::{AudioStreamRendererFactory, AudioStreamSpec, Channels, SamplingDepth}, input_service::{InputEventReceiver, InputService}, media_sink::MediaService, video_renderer::{VideoSpec, VideoStreamRendererFactory}, Service
     },
     usb::UsbManager,
 };
@@ -54,6 +51,7 @@ async fn main() -> Result<(), ()> {
         error!("control-c");
     });
 
+    let input_event_receiver = InputEventReceiver::new();
     PacketRouter::start(
         usb_manager,
         cancel_token,
@@ -71,32 +69,31 @@ async fn main() -> Result<(), ()> {
             Box::new(MediaService::new(
                 2,
                 Arc::new(VideoStreamRendererFactory::new()),
-                (),
+                VideoSpec {
+                    resolution: protos::VideoCodecResolutionType::Video1920x1080,
+                    frame_rate: protos::VideoFrameRateType::VideoFps60,
+                    dpi: 300,
+                    input_event_receiver: input_event_receiver.clone(),
+                },
             )),
-            Box::new(InputService::new()),
-            StubService::new(protos::Service {
-                id: 4,
-                media_sink_service: Some(protos::MediaSinkService {
-                    available_type: Some(protos::MediaCodecType::MediaCodecAudioPcm as i32),
-                    audio_type: Some(protos::AudioStreamType::AudioStreamSystemAudio as i32),
-                    audio_configs: vec![protos::AudioConfiguration {
-                        sampling_rate: 16000,
-                        number_of_bits: 16,
-                        number_of_channels: 1,
-                    }],
-                    available_while_in_call: Some(true),
-
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+            Box::new(InputService::new(3, input_event_receiver, (1920, 1080))),
+            //Box::new(MediaService::new(
+            //    4,
+            //    audio_stream_renderer_factory.clone(),
+            //    AudioStreamSpec {
+            //        sampling_rate: 16000,
+            //        channels: Channels::Mono,
+            //        sampling_depth: SamplingDepth::Bits16,
+            //        stream_type: protos::AudioStreamType::AudioStreamSystemAudio,
+            //    },
+            //)),
             Box::new(MediaService::new(
                 5,
                 audio_stream_renderer_factory.clone(),
                 AudioStreamSpec {
                     sampling_rate: 48000,
-                    channels: 2,
-                    sampling_depth_bits: 16,
+                    channels: Channels::Stereo,
+                    sampling_depth: SamplingDepth::Bits16,
                     stream_type: protos::AudioStreamType::AudioStreamMedia,
                 },
             )),
