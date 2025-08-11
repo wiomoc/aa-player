@@ -515,6 +515,26 @@ impl WeakChannelPacketSender {
             })
             .transpose()
     }
+
+    pub(crate) fn blocking_send_raw(
+        &self,
+        message_id: u16,
+        payload: &[u8],
+    ) -> Result<Option<()>, mpsc::error::SendError<Packet>> {
+        self.sender
+            .upgrade()
+            .map(|sender| {
+                let packet = Packet::new_from_parts(
+                    self.channel_id,
+                    AAPFrameType::ChannelSpecific,
+                    true,
+                    message_id,
+                    payload,
+                );
+                sender.blocking_send(packet)
+            })
+            .transpose()
+    }
 }
 
 pub(crate) struct ChannelPacketSender {

@@ -73,7 +73,7 @@ impl InputEventReceiverInner {
         }
 
         self.packet_sender.blocking_send_proto(
-            InputService::MESSAGE_ID_INPUT_REPORT,
+            InputSourceService::MESSAGE_ID_INPUT_REPORT,
             &protos::InputReport {
                 timestamp: now
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -123,13 +123,13 @@ impl InputEventReceiver {
         }
     }
 }
-pub(crate) struct InputService {
+pub(crate) struct InputSourceService {
     service_id: u8,
     input_event_receiver: InputEventReceiver,
     display_size: (u32, u32)
 }
 
-impl InputService {
+impl InputSourceService {
     const MESSAGE_ID_INPUT_REPORT: u16 = 0x8001;
     const MESSAGE_ID_KEY_BINDING_REQUEST: u16 = 0x8002;
     const MESSAGE_ID_KEY_BINDING_RESPONSE: u16 = 0x8003;
@@ -144,7 +144,7 @@ impl InputService {
     }
 }
 
-impl Service for InputService {
+impl Service for InputSourceService {
     fn get_id(&self) -> i32 {
         self.service_id as i32
     }

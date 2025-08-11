@@ -1,9 +1,12 @@
 use std::{
-    cmp::min, collections::VecDeque, io::Read, sync::{atomic::AtomicBool, Arc}
+    cmp::min,
+    collections::VecDeque,
+    io::Read,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use log::{error, warn};
+use log::{error, info, warn};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -88,29 +91,51 @@ impl StreamRendererFactory for AudioStreamRendererFactory {
     }
 
     fn create(&self, spec: &Self::Spec) -> Result<Self::Renderer, ()> {
-        let config = self
+        let (config, resplicate_sample_count) = self
             .device
             .supported_output_configs()
             .unwrap()
-            .filter_map(|config| config.try_with_sample_rate(cpal::SampleRate(spec.sampling_rate)))
-            .find(|config: &_| {
-                let channel_count_acceptable = match (spec.channels, config.channels()) {
-                    (Channels::Mono, 1) => true,
-                    (Channels::Mono, 2) => true,
-                    (Channels::Stereo, 2) => true,
-                    _ => false,
-                };
-                let sampling_depth_acceptable =
-                    config.sample_format().sample_size() == spec.sampling_depth.bytes() as usize;
-
-                channel_count_acceptable && sampling_depth_acceptable
+            .filter_map(|config| {
+                for replicate_sample_count in 1..=4 {
+                    if let Some(config) = config.try_with_sample_rate(cpal::SampleRate(
+                        spec.sampling_rate * replicate_sample_count,
+                    )) {
+                        return Some((config, replicate_sample_count));
+                    }
+                }
+                return None;
             })
+            .filter_map(
+                |(config, replicate_sample_count): (cpal::SupportedStreamConfig, u32)| {
+                    let total_resample_count = match (spec.channels, config.channels()) {
+                        (Channels::Mono, 1) => replicate_sample_count,
+                        (Channels::Mono, 2) => 2 * replicate_sample_count,
+                        (Channels::Stereo, 2) if replicate_sample_count == 1 => replicate_sample_count,
+                        _ => return None,
+                    };
+                    let sampling_depth_acceptable = config.sample_format().sample_size()
+                        == spec.sampling_depth.bytes() as usize;
+
+                    if sampling_depth_acceptable {
+                        return Some((config, total_resample_count));
+                    } else {
+                        None
+                    }
+                },
+            )
+            .min_by_key(
+                |(_config, replicate_sample_count): &(cpal::SupportedStreamConfig, u32)| {
+                    *replicate_sample_count
+                },
+            )
             .ok_or(())
-            .map_err(|_| error!("couldn't find usable audio config"))?
-            .config();
-        let convert_mono_to_stereo =
-            config.channels == 2 && matches!(spec.channels, Channels::Mono);
-        AudioStreamRenderer::new(self.device.clone(), config, convert_mono_to_stereo)
+            .map_err(|_| error!("couldn't find usable audio config"))?;
+
+        AudioStreamRenderer::new(
+            self.device.clone(),
+            config.config(),
+            resplicate_sample_count,
+        )
     }
 }
 
@@ -124,11 +149,12 @@ impl AudioStreamRenderer {
     fn new(
         device: cpal::Device,
         config: cpal::StreamConfig,
-        mono_to_stereo: bool,
+        replicate_sample_count: u32,
     ) -> Result<Self, ()> {
         let buffer = Arc::new(Mutex::new(VecDeque::<u8>::with_capacity(10000)));
         let buffer_clone = buffer.clone();
         let mut first = AtomicBool::new(true);
+
         let stream = device
             .build_output_stream(
                 &config,
@@ -144,39 +170,36 @@ impl AudioStreamRenderer {
                     let mut buffer: tokio::sync::MutexGuard<'_, VecDeque<u8>> =
                         buffer_clone.blocking_lock();
 
-                    if mono_to_stereo {
-                        let count_stereo_samples = min(data.len() / 2, buffer.len() / (2 * sample_size));
-                        let data_raw_slice = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                data.as_ptr() as *mut u8,
-                                count_stereo_samples * sample_size,
-                            )
-                        };
-                        buffer.read_exact(data_raw_slice).unwrap();
+                    let replicate_sample_count = replicate_sample_count as usize;
+                    let sample_count = min(
+                        data.len() / replicate_sample_count,
+                        buffer.len() / (sample_size * replicate_sample_count),
+                    );
+                    let data_raw_slice = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            data.as_ptr() as *mut u8,
+                            sample_count * sample_size,
+                        )
+                    };
 
-                        let mut write_pos = count_stereo_samples * 2 - 2;
-                        let mut read_pos = count_stereo_samples - 1;
+                    buffer.read_exact(data_raw_slice).unwrap();
+
+                    let total_sample_count = sample_count * replicate_sample_count;
+                    if replicate_sample_count > 1 {
+                        let mut write_pos = total_sample_count - replicate_sample_count;
+                        let mut read_pos = sample_count - 1;
 
                         while read_pos > 0 {
                             let sample = data[read_pos];
-                            data[write_pos] = sample;
-                            data[write_pos + 1] = sample;
+                            for i in 0..replicate_sample_count {
+                                data[write_pos + i] = sample;
+                            }
                             read_pos -= 1;
-                            write_pos -= 2;
+                            write_pos -= replicate_sample_count;
                         }
-
-                        data[(count_stereo_samples * 2)..].fill(0);
-                    } else {
-                        let count_samples = min(data.len(), buffer.len() / sample_size);
-                        let data_raw_slice = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                data.as_ptr() as *mut u8,
-                                count_samples * sample_size,
-                            )
-                        };
-                        buffer.read_exact(data_raw_slice).unwrap();
-                        data[count_samples..].fill(0);
                     }
+
+                    data[total_sample_count..].fill(0);
                 },
                 move |err| {
                     // react to errors here.

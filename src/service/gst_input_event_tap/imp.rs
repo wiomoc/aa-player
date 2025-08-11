@@ -12,6 +12,7 @@ use gstreamer::prelude::{ElementClassExt, ElementExt};
 use gstreamer::subclass::prelude::ElementImpl;
 use gstreamer::subclass::prelude::ElementImplExt;
 use gstreamer::subclass::prelude::GstObjectImpl;
+use log::info;
 
 
 pub struct InputEventTap {

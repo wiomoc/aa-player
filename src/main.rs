@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::{process::exit, sync::Arc};
 
 use log::{debug, error, info};
 use prost::Message;
@@ -11,7 +11,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     packet_router::PacketRouter,
     service::{
-        audio_renderer::{AudioStreamRendererFactory, AudioStreamSpec, Channels, SamplingDepth}, input_service::{InputEventReceiver, InputService}, media_sink::MediaService, video_renderer::{VideoSpec, VideoStreamRendererFactory}, Service
+        Service,
+        audio_renderer::{AudioStreamRendererFactory, AudioStreamSpec, Channels, SamplingDepth},
+        audio_source::AudioSourceService,
+        input_source::{InputEventReceiver, InputSourceService},
+        media_sink::MediaService,
+        video_renderer::{VideoSpec, VideoStreamRendererFactory},
     },
     usb::UsbManager,
 };
@@ -54,7 +59,7 @@ async fn main() -> Result<(), ()> {
     let input_event_receiver = InputEventReceiver::new();
     PacketRouter::start(
         usb_manager,
-        cancel_token,
+        cancel_token.clone(),
         &[
             StubService::new(protos::Service {
                 id: 1,
@@ -74,21 +79,32 @@ async fn main() -> Result<(), ()> {
                     frame_rate: protos::VideoFrameRateType::VideoFps60,
                     dpi: 300,
                     input_event_receiver: input_event_receiver.clone(),
+                    cancel_token_on_close_clicked: cancel_token,
                 },
             )),
-            Box::new(InputService::new(3, input_event_receiver, (1920, 1080))),
-            //Box::new(MediaService::new(
-            //    4,
-            //    audio_stream_renderer_factory.clone(),
-            //    AudioStreamSpec {
-            //        sampling_rate: 16000,
-            //        channels: Channels::Mono,
-            //        sampling_depth: SamplingDepth::Bits16,
-            //        stream_type: protos::AudioStreamType::AudioStreamSystemAudio,
-            //    },
-            //)),
+            Box::new(InputSourceService::new(3, input_event_receiver, (1920, 1080))),
+            Box::new(MediaService::new(
+                4,
+                audio_stream_renderer_factory.clone(),
+                AudioStreamSpec {
+                    sampling_rate: 16000,
+                    channels: Channels::Mono,
+                    sampling_depth: SamplingDepth::Bits16,
+                    stream_type: protos::AudioStreamType::AudioStreamGuidance,
+                },
+            )),
             Box::new(MediaService::new(
                 5,
+                audio_stream_renderer_factory.clone(),
+                AudioStreamSpec {
+                    sampling_rate: 16000,
+                    channels: Channels::Mono,
+                    sampling_depth: SamplingDepth::Bits16,
+                    stream_type: protos::AudioStreamType::AudioStreamSystemAudio,
+                },
+            )),
+            Box::new(MediaService::new(
+                6,
                 audio_stream_renderer_factory.clone(),
                 AudioStreamSpec {
                     sampling_rate: 48000,
@@ -97,55 +113,22 @@ async fn main() -> Result<(), ()> {
                     stream_type: protos::AudioStreamType::AudioStreamMedia,
                 },
             )),
-            /*Box::new(MediaService::new(
-                6,
-                audio_stream_renderer_factory.clone(),
-                AudioStreamSpec {
-                    sampling_rate: 16000,
-                    channels: 1,
-                    sampling_depth_bits: 8,
-                    stream_type: protos::AudioStreamType::AudioStreamTelephony,
-                },
-            )),
-            Box::new(MediaService::new(
-                7,
-                audio_stream_renderer_factory.clone(),
-                AudioStreamSpec {
-                    sampling_rate: 16000,
-                    channels: 1,
-                    sampling_depth_bits: 16,
-                    stream_type: protos::AudioStreamType::AudioStreamGuidance,
-                },
-            )),
-            Box::new(MediaService::new(
-                8,
-                audio_stream_renderer_factory,
-                AudioStreamSpec {
-                    sampling_rate: 16000,
-                    channels: 1,
-                    sampling_depth_bits: 16,
-                    stream_type: protos::AudioStreamType::AudioStreamSystemAudio,
-                },
-            )),*/
-            StubService::new(protos::Service {
-                id: 9,
-                media_source_service: Some(protos::MediaSourceService {
-                    available_type: Some(protos::MediaCodecType::MediaCodecAudioPcm as i32),
-                    audio_config: Some(protos::AudioConfiguration {
-                        sampling_rate: 16000,
-                        number_of_bits: 16,
-                        number_of_channels: 1,
-                    }),
-                    available_while_in_call: Some(true),
-                }),
-                ..Default::default()
-            }),
+            //Box::new(MediaService::new(
+            //    7,
+            //    audio_stream_renderer_factory.clone(),
+            //    AudioStreamSpec {
+            //        sampling_rate: 16000,
+            //        channels: Channels::Mono,
+            //        sampling_depth: SamplingDepth::Bits16,
+            //        stream_type: protos::AudioStreamType::AudioStreamTelephony,
+            //    },
+            //)),
+            Box::new(AudioSourceService::new(9)),
         ],
     )
     .await;
-    error!("end");
-
-    Ok(())
+    info!("exiting now");
+    exit(0);
 }
 
 struct StubService {

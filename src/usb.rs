@@ -69,8 +69,6 @@ impl UsbManager {
 
         let join_handle = tokio::spawn(state.start_device_handle_loop(cancel_token.clone()));
 
-        
-
         UsbManager {
             incoming_queue_receiver,
             outgoing_queue_sender,

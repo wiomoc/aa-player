@@ -6,13 +6,14 @@ use gstreamer::{
 };
 use gstreamer_app::AppSrc;
 use log::{error, info};
+use tokio_util::sync::CancellationToken;
 use std::{thread};
 
 use crate::{
     protos,
     service::{
         gst_input_event_tap::InputEventTap,
-        input_service::InputEventReceiver,
+        input_source::InputEventReceiver,
         media_sink::{StreamRenderer, StreamRendererFactory},
     },
 };
@@ -31,6 +32,7 @@ pub(crate) struct VideoSpec {
     pub(crate) frame_rate: protos::VideoFrameRateType,
     pub(crate) dpi: u32,
     pub(crate) input_event_receiver: InputEventReceiver,
+    pub(crate) cancel_token_on_close_clicked: CancellationToken
 }
 
 impl VideoSpec {
@@ -85,6 +87,7 @@ impl StreamRendererFactory for VideoStreamRendererFactory {
 pub(crate) struct VideoStreamRenderer {
     appsrc: AppSrc,
     pipeline: gstreamer::Pipeline,
+    cancel_token_on_close_clicked: CancellationToken
 }
 
 impl VideoStreamRenderer {
@@ -120,7 +123,7 @@ impl VideoStreamRenderer {
                     "mouse-move" => protos::PointerAction::ActionMoved,
                     "mouse-button-release" => protos::PointerAction::ActionUp,
                     "mouse-button-press" => protos::PointerAction::ActionDown,
-                    _ => return None,
+                    ev @ _ => { info!("ecent {:?}", &structure); return None;},
                 };
                 let pointer_x = structure.get::<'_, f64>("pointer_x").unwrap() as u32;
                 let pointer_y = structure.get::<'_, f64>("pointer_y").unwrap() as u32;
@@ -155,6 +158,7 @@ impl VideoStreamRenderer {
         Self {
             pipeline,
             appsrc,
+            cancel_token_on_close_clicked: spec.cancel_token_on_close_clicked.clone()
         }
     }
 }
@@ -163,6 +167,7 @@ impl StreamRenderer for VideoStreamRenderer {
     fn start(&mut self) {
         self.pipeline.set_state(gstreamer::State::Playing).unwrap();
         let pipeline_clone = self.pipeline.clone();
+        let cancel_token_on_close_clicked = self.cancel_token_on_close_clicked.clone();
         thread::spawn(move || {
             let bus = pipeline_clone
                 .bus()
@@ -176,6 +181,10 @@ impl StreamRenderer for VideoStreamRenderer {
                     MessageView::Error(err) => {
                         error!("gst {err:?}");
                         pipeline_clone.set_state(gstreamer::State::Null).unwrap();
+                        if err.error().message() == "Output window was closed" {
+                            cancel_token_on_close_clicked.cancel();
+                            break;
+                        }
                     }
                     _ => (),
                 }
@@ -185,7 +194,7 @@ impl StreamRenderer for VideoStreamRenderer {
     }
 
     fn stop(&mut self) {
-        todo!()
+        self.pipeline.set_state(gstreamer::State::Null).unwrap();
     }
 
     async fn add_content(
@@ -214,5 +223,12 @@ impl StreamRenderer for VideoStreamRenderer {
             focus: Some(protos::VideoFocusMode::VideoFocusProjected as i32),
             ..Default::default()
         })
+    }
+}
+
+impl Drop for VideoStreamRenderer {
+    fn drop(&mut self) {
+        self.pipeline.set_state(gstreamer::State::Null).unwrap();
+        let _ = self.appsrc.end_of_stream();
     }
 }

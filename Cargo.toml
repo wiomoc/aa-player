@@ -18,6 +18,7 @@ cpal = "0.16.0"
 gstreamer = "0.24.0"
 gstreamer-app = "0.24.0"
 glib = "0.21.0"
+samplerate = "0.2.4"
 
 [patch.crates-io]
 rustls-webpki = {git = "https://github.com/uglyoldbob/webpki.git"}
