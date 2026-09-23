@@ -1,3 +1,6 @@
+//! Android Auto head unit emulator: connects to a phone over USB (AOA) and
+//! renders its projected video/audio while forwarding touch input back.
+
 #![allow(dead_code)]
 
 use std::{process::exit, sync::Arc};
@@ -45,6 +48,7 @@ async fn main() -> Result<(), ()> {
 
     let usb_manager = UsbManager::start();
     let audio_stream_renderer_factory = Arc::new(AudioStreamRendererFactory::new());
+    // Typing `c` on stdin shuts down gracefully.
     let cancel_token_cloned = cancel_token.clone();
     tokio::spawn(async move {
         let mut buf = [0u8];
@@ -57,6 +61,7 @@ async fn main() -> Result<(), ()> {
     });
 
     let input_event_receiver = InputEventReceiver::new();
+    // Services advertised to the phone during service discovery.
     PacketRouter::start(
         usb_manager,
         cancel_token.clone(),
@@ -131,6 +136,8 @@ async fn main() -> Result<(), ()> {
     exit(0);
 }
 
+/// Service that only advertises a descriptor and answers key binding
+/// requests, without implementing any real functionality.
 struct StubService {
     descriptor: protos::Service,
 }

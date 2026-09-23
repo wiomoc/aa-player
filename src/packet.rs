@@ -7,11 +7,13 @@ use crate::{
     frame::{AAPFrame, AAPFrameFragmmentation, AAPFrameType},
 };
 
+/// A complete (defragmented, decrypted) message on a channel.
 #[derive(Debug)]
 pub(crate) struct Packet {
     pub channel_id: u8,
     pub r#type: AAPFrameType,
     pub encrypted: bool,
+    /// Big-endian `u16` message id followed by the message payload.
     pub message_id_and_payload: Vec<u8>,
 }
 
@@ -67,6 +69,8 @@ impl Packet {
     }
 }
 
+/// Converts between packets and frames: splits/encrypts outgoing packets and
+/// decrypts/reassembles incoming frames.
 pub(crate) struct PacketFramer {
     pending_frame: Option<AAPFrame>,
     encrypted_connection_manager: EncryptedConnectionManager,
@@ -94,6 +98,8 @@ impl PacketFramer {
         self.encrypted_connection_manager.is_handshaking()
     }
 
+    /// Encrypts (if requested) and splits `packet` into frames of at most
+    /// `MAX_FRAME_PAYLOAD_LENGTH` bytes, handing each to `frame_sender`.
     pub(crate) async fn process_outgoing_packet(
         &mut self,
         packet: Packet,
@@ -158,6 +164,8 @@ impl PacketFramer {
         Ok(())
     }
 
+    /// Decrypts `frame` and appends it to the pending packet. Returns the
+    /// packet once its last fragment has arrived, `None` otherwise.
     pub(crate) fn process_incoming_frame(
         &mut self,
         mut frame: AAPFrame,

@@ -1,6 +1,7 @@
 pub (crate) mod imp;
 
 glib::wrapper! {
+    /// See [`imp::InputEventTap`].
     pub struct InputEventTap(ObjectSubclass<imp::InputEventTap>)
          @extends gstreamer::Element, gstreamer::Object;
 }

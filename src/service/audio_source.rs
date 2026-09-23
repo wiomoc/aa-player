@@ -7,6 +7,8 @@ use prost::Message;
 
 use crate::{packet_router::ChannelPacketSender, protos, service::Service};
 
+/// Microphone service: streams 16kHz mono PCM from the default input device
+/// while the phone has the microphone opened.
 pub(crate) struct AudioSourceService {
     service_id: u8,
 }
@@ -110,6 +112,7 @@ impl Service for AudioSourceService {
                                 warn!("could not decode microphone request message {err:?}")
                             })?;
                         info!("request {:?}", &request);
+                        // drop any running capture stream
                         stream.take();
                         if !request.open {
                             packet_sender
@@ -141,6 +144,7 @@ impl Service for AudioSourceService {
                             .build_input_stream_raw(
                                 &config,
                                 cpal::SampleFormat::I16,
+                                // sent as timestamped content: u64 BE micros + PCM data
                                 move |data: &cpal::Data, info: &_| {
                                     //let converted = samplerate::convert(
                                     //    config.sample_rate.0,

@@ -1,3 +1,5 @@
+//! Message ids and packet builders for the control channel (channel 0).
+
 use std::time::{SystemTime};
 
 use crate::{frame::AAPFrameType, packet::Packet, protos};
@@ -24,6 +26,7 @@ pub(crate) fn build_version_request_packet() -> Packet {
         AAPFrameType::ChannelSpecific,
         false,
         MESSAGE_ID_GET_VERSION_REQUEST,
+        // protocol version 1.1 (major u16, minor u16)
         &[0, 1, 0, 1],
     )
 }
@@ -95,6 +98,7 @@ pub(crate) fn build_focus_notification_packet(focus_state: protos::AudioFocusSta
     )
 }
 
+/// Unlike the other builders this is sent on the channel being opened, not on the control channel.
 pub(crate) fn build_channel_open_response(channel_id: u8, status: protos::MessageStatus) -> Packet {
     let payload = protos::ChannelOpenResponse {
         status: status as i32,

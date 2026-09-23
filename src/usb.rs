@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::frame::{AAPFrame, AAPFrameCodec, AsyncReader, AsyncWriter, FrameDecoder, FrameEncoder};
 
+/// Handle to the background task that watches for USB devices, switches them
+/// to Android Open Accessory (AOA) mode and exchanges frames with them.
 pub struct UsbManager {
     incoming_queue_receiver: mpsc::Receiver<IncomingEvent>,
     outgoing_queue_sender: mpsc::Sender<OutgoingEvent>,
@@ -41,12 +43,14 @@ struct UsbInternalState {
     tx_loop_join_handle: Option<JoinHandle<()>>
 }
 
+/// Events from the USB layer to the packet router.
 pub(crate) enum IncomingEvent {
     Connected,
     Closed,
     Frame(AAPFrame),
 }
 
+/// Requests from the packet router to the USB layer.
 pub(crate) enum OutgoingEvent {
     Close,
     Frame(AAPFrame),
@@ -90,6 +94,7 @@ impl UsbManager {
         self.outgoing_queue_sender.send(OutgoingEvent::Close).await
     }
 
+    /// Waits for the next incoming event; reports `Closed` if the USB task is gone.
     pub async fn recv_frame(&mut self) -> IncomingEvent {
         self.incoming_queue_receiver
             .recv()
@@ -108,6 +113,7 @@ impl UsbInternalState {
     const AOA_PID_V1: u16 = 0x2D00;
     const AOA_PID_V2: u16 = 0x2D01;
 
+    /// Handles already connected and hotplugged devices until cancelled.
     async fn start_device_handle_loop(mut self, cancel_token: CancellationToken) {
         let mut watch = nusb::watch_devices().expect("can't start watching devices");
         let initial_devices = nusb::list_devices().expect("can't list devices");
@@ -144,6 +150,8 @@ impl UsbInternalState {
         }
     }
 
+    /// Connects to devices already in AOA mode, tries to switch all others into
+    /// it (they then re-enumerate as AOA device). Only one device is served at a time.
     async fn handle_connected_device(&mut self, device_info: DeviceInfo) {
         {
             if let Some(device_state) = self.connected_device.as_ref()
@@ -191,6 +199,7 @@ impl UsbInternalState {
             out_endpoint_address,
             max_packet_size,
         )) = device.configurations().find_map(|config| {
+            // first interface with a bulk IN and a bulk OUT endpoint
             config.interfaces().find_map(|interface| {
                 interface.alt_settings().find_map(|alt_settings| {
                     if let Some(in_endpoint) = alt_settings.endpoints().find(|endpoint| {
@@ -275,6 +284,7 @@ impl UsbInternalState {
         }
     }
 
+    /// Reads frames from the device and forwards them as `IncomingEvent`s.
     async fn start_aoa_rx_loop(
         incoming_queue: mpsc::Sender<IncomingEvent>,
         interface: Interface,
@@ -311,6 +321,7 @@ impl UsbInternalState {
         }
     }
 
+    /// Writes queued outgoing frames to the device.
     async fn start_aoa_tx_loop(
         outgoing_queue: Arc<Mutex<mpsc::Receiver<OutgoingEvent>>>,
         interface: Interface,
@@ -356,6 +367,8 @@ impl UsbInternalState {
         }
     }
 
+    /// Performs the AOA handshake: query protocol version, send identification
+    /// strings, then request accessory mode. Non-AOA-capable devices are skipped.
     async fn switch_device_to_aoa_mode(device_info: DeviceInfo) -> Result<(), nusb::Error> {
         info!("switching usb device {:?} to aoa mode", device_info.id());
         let device = match device_info.open() {
@@ -385,6 +398,7 @@ impl UsbInternalState {
         let send_control_out =
             async |control: ControlOut| interface.control_out(control).await.into_result();
 
+        // ACCESSORY_GET_PROTOCOL
         let response = send_control_in(ControlIn {
             control_type: ControlType::Vendor,
             recipient: Recipient::Device,
@@ -395,11 +409,13 @@ impl UsbInternalState {
         })
         .await;
 
+        // only AOA protocol version 2 is supported
         match response.as_deref() {
             Ok([2, 0]) => (),
             _ => return Ok(()),
         }
 
+        // ACCESSORY_SEND_STRING
         let send_string = async |string_id: u16, string: &str| {
             let uri = CString::new(string).unwrap();
 
@@ -414,6 +430,7 @@ impl UsbInternalState {
             .await
         };
 
+        // manufacturer, model, description, version, URI, serial
         send_string(0, "Android").await?;
         send_string(1, "Android").await?;
         send_string(2, "Auto").await?;
@@ -421,6 +438,7 @@ impl UsbInternalState {
         send_string(4, "").await?;
         send_string(5, "").await?;
 
+        // ACCESSORY_START
         send_control_out(ControlOut {
             control_type: ControlType::Vendor,
             recipient: Recipient::Device,
@@ -437,6 +455,7 @@ impl UsbInternalState {
     }
 }
 
+/// Buffered reader over a bulk IN endpoint, reading one USB packet at a time.
 struct UsbReader {
     interface: Interface,
     endpoint: u8,
@@ -479,6 +498,7 @@ impl UsbReader {
             match response {
                 Ok(packet) => {
                     if packet.is_empty() {
+                        // zero-length transfer: back off briefly and retry
                         select! {
                             _ = self.terminate_connection_token.cancelled() => { return Err(Error::from(ErrorKind::UnexpectedEof)); }
                             _ = time::sleep(Duration::from_millis(2)) => {}
@@ -524,6 +544,8 @@ impl AsyncReader for UsbReader {
     }
 }
 
+/// Buffered writer over a bulk OUT endpoint; data is sent in `packet_size` chunks
+/// or when `flush_buffer` is called.
 struct UsbWriter {
     interface: Interface,
     endpoint: u8,

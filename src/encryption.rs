@@ -15,10 +15,13 @@ use rustls::{
     version::TLS12,
 };
 
+/// Holds the TLS client config (head unit certificate + CA) shared by all connections.
 pub(crate) struct EncryptionManager {
     client_config: Arc<ClientConfig>,
 }
 
+/// TLS 1.2 session for a single phone connection. The phone acts as TLS server;
+/// TLS records are tunneled through handshake packets and encrypted frames.
 pub(crate) struct EncryptedConnectionManager {
     conn: UnbufferedClientConnection,
     is_handshaking: bool,
@@ -43,6 +46,8 @@ impl EncryptionManager {
     }
 
     pub(crate) fn new_connection(&self) -> EncryptedConnectionManager {
+        // The phone certificate isn't issued for any name, so a dummy name is
+        // used and name mismatches are ignored by `CustomServerCertVerifier`.
         let conn = UnbufferedClientConnection::new(
             self.client_config.clone(),
             ServerName::IpAddress(Ipv4Addr::new(0, 0, 0, 0).into()),
@@ -55,6 +60,7 @@ impl EncryptionManager {
         }
     }
 
+    /// Loads the embedded CA certificate, client certificate chain and private key.
     fn load_cert_and_key() -> (
         CertificateDer<'static>,
         Vec<CertificateDer<'static>>,
@@ -79,6 +85,8 @@ impl EncryptionManager {
 }
 
 impl EncryptedConnectionManager {
+    /// Feeds received handshake data into the TLS state machine and returns the
+    /// TLS records to send back, if any. Pass an empty payload to start the handshake.
     pub(crate) fn process_handshake_message(
         &mut self,
         payload: &mut [u8],
@@ -95,6 +103,7 @@ impl EncryptedConnectionManager {
 
             match state {
                 ConnectionState::EncodeTlsData(mut encode_tls_data) => {
+                    // Encode into an empty buffer first to learn the required size.
                     let initial_result = encode_tls_data.encode(&mut []);
                     let initial_err = initial_result.unwrap_err();
                     let message_size = match initial_err {
@@ -131,6 +140,7 @@ impl EncryptedConnectionManager {
         }
     }
 
+    /// Encrypts `message` into one or more TLS application data records.
     pub(crate) fn encrypt_message(&mut self, message: &[u8]) -> Result<Vec<u8>, ()> {
         assert!(!self.is_handshaking);
 
@@ -163,6 +173,7 @@ impl EncryptedConnectionManager {
         }
     }
 
+    /// Decrypts all TLS records in `encrypted_message` and concatenates their plaintext.
     pub(crate) fn decrypt_message(&mut self, encrypted_message: &mut [u8]) -> Result<Vec<u8>, ()> {
         if self.is_handshaking {
             error!("trying to decrypt but handshaking not finshed");
@@ -208,6 +219,7 @@ impl EncryptedConnectionManager {
     }
 }
 
+/// Verifies the phone certificate against the embedded CA but accepts any server name.
 #[derive(Debug)]
 struct CustomServerCertVerifier(Arc<WebPkiServerVerifier>);
 

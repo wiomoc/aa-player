@@ -1,5 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
 
+/// Position of a frame within a fragmented packet (lower two bits of the flags byte).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AAPFrameFragmmentation {
     Continuation = 0,
@@ -8,18 +9,21 @@ pub(crate) enum AAPFrameFragmmentation {
     Unfragmented = 3,
 }
 
+/// Whether a frame carries channel control messages (e.g. channel open) or channel payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AAPFrameType {
     ChannelSpecific = 0,
     Control = 1,
 }
 
+/// A single Android Auto Protocol frame as sent over the wire.
 #[derive(Debug)]
 pub(crate) struct AAPFrame {
     pub channel_id: u8,
     pub frag_info: AAPFrameFragmmentation,
     pub r#type: AAPFrameType,
     pub encrypted: bool,
+    /// Length of the whole reassembled packet; only transmitted on `First` fragments.
     pub total_payload_length: usize,
     pub payload: Vec<u8>,
 }
@@ -45,6 +49,8 @@ pub(crate) trait FrameEncoder<W: AsyncWriter> {
     -> Result<(), std::io::Error>;
 }
 
+/// Encodes/decodes frames with the layout
+/// `[channel_id: u8][flags: u8][fragment_len: u16 BE]([total_len: u32 BE] if First)[payload]`.
 pub(crate) struct AAPFrameCodec;
 
 impl AAPFrameCodec {

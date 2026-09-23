@@ -18,6 +18,7 @@ use crate::{
     },
 };
 
+/// Creates GStreamer based H.264 video renderers.
 pub(crate) struct VideoStreamRendererFactory {}
 
 impl VideoStreamRendererFactory {
@@ -26,12 +27,15 @@ impl VideoStreamRendererFactory {
     }
 }
 
+/// Video format offered to the phone plus the hooks the renderer window needs.
 #[derive(Clone)]
 pub(crate) struct VideoSpec {
     pub(crate) resolution: protos::VideoCodecResolutionType,
     pub(crate) frame_rate: protos::VideoFrameRateType,
     pub(crate) dpi: u32,
+    /// Receives mouse events from the video window as touch input.
     pub(crate) input_event_receiver: InputEventReceiver,
+    /// Cancelled when the video window is closed.
     pub(crate) cancel_token_on_close_clicked: CancellationToken
 }
 
@@ -84,6 +88,8 @@ impl StreamRendererFactory for VideoStreamRendererFactory {
     }
 }
 
+/// Decodes and displays the H.264 stream with the pipeline
+/// `appsrc ! InputEventTap ! decoder ! [videoconvert] ! sink`.
 pub(crate) struct VideoStreamRenderer {
     appsrc: AppSrc,
     pipeline: gstreamer::Pipeline,
@@ -114,6 +120,7 @@ impl VideoStreamRenderer {
             .build();
 
         let input_event_receiver = spec.input_event_receiver.clone();
+        // translate window mouse events into touch events for the phone
         let event_interceptor = InputEventTap::new();
         event_interceptor.connect("input-event", false, move |args| {
             let event: gstreamer::Event = args[1].get().unwrap();
@@ -168,6 +175,7 @@ fn make_decoder_and_sink() -> (gstreamer::Element, gstreamer::Element) {
     )
 }
 
+/// Builds the first GStreamer element from `factories` that is installed.
 fn make_first_available(factories: &[&str]) -> gstreamer::Element {
     factories
         .iter()
@@ -180,6 +188,7 @@ impl StreamRenderer for VideoStreamRenderer {
         self.pipeline.set_state(gstreamer::State::Playing).unwrap();
         let pipeline_clone = self.pipeline.clone();
         let cancel_token_on_close_clicked = self.cancel_token_on_close_clicked.clone();
+        // watch the pipeline bus for errors and for the window being closed
         thread::spawn(move || {
             let bus = pipeline_clone
                 .bus()
@@ -224,7 +233,7 @@ impl StreamRenderer for VideoStreamRenderer {
             .unwrap()
             .copy_from_slice(0, content)
             .unwrap();
-        self.appsrc.push_buffer(buffer).unwrap();
+        self.appsrc.push_buffer(buffer);
     }
 
     fn handle_video_focus_notification_request(

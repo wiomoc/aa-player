@@ -14,6 +14,8 @@ use crate::{
     service::Service,
 };
 
+/// Shared entry point for touch events from the UI. Events are forwarded to the
+/// phone while an input channel is open and dropped otherwise.
 #[derive(Clone)]
 pub(crate) struct InputEventReceiver {
     inner: Arc<Mutex<Option<InputEventReceiverInner>>>,
@@ -41,6 +43,8 @@ impl InputEventReceiverInner {
         x_diff * x_diff + y_diff * y_diff
     }
 
+    /// Sends a touch event. Moves are ignored while no pointer is down and
+    /// debounced (30ms / 15px). Returns `Ok(None)` if the channel is gone.
     fn report_touch_event(
         &mut self,
         action: protos::PointerAction,
@@ -103,6 +107,7 @@ impl InputEventReceiver {
         self.inner.lock().unwrap().take();
     }
 
+    /// Forwards a touch event; unregisters the channel if it has been closed.
     pub(crate) fn report_touch_event(
         &self,
         action: protos::PointerAction,
@@ -123,6 +128,7 @@ impl InputEventReceiver {
         }
     }
 }
+/// Input source service exposing a single touchscreen to the phone.
 pub(crate) struct InputSourceService {
     service_id: u8,
     input_event_receiver: InputEventReceiver,

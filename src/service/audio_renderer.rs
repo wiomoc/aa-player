@@ -51,6 +51,7 @@ impl SamplingDepth {
     }
 }
 
+/// Format of a PCM audio stream as offered to the phone.
 #[derive(Clone)]
 pub(crate) struct AudioStreamSpec {
     pub(crate) sampling_rate: u32,
@@ -59,6 +60,7 @@ pub(crate) struct AudioStreamSpec {
     pub(crate) stream_type: protos::AudioStreamType,
 }
 
+/// Creates cpal based renderers on the default output device.
 pub(crate) struct AudioStreamRendererFactory {
     host: cpal::Host,
     device: cpal::Device,
@@ -90,6 +92,8 @@ impl StreamRendererFactory for AudioStreamRendererFactory {
         }
     }
 
+    /// Picks the output config needing the least sample replication. Lower
+    /// sample rates and mono-to-stereo are handled by duplicating samples.
     fn create(&self, spec: &Self::Spec) -> Result<Self::Renderer, ()> {
         let (config, resplicate_sample_count) = self
             .device
@@ -139,6 +143,7 @@ impl StreamRendererFactory for AudioStreamRendererFactory {
     }
 }
 
+/// Plays PCM content through a cpal output stream fed from a shared byte queue.
 pub(crate) struct AudioStreamRenderer {
     device: cpal::Device,
     stream: cpal::Stream,
@@ -160,6 +165,7 @@ impl AudioStreamRenderer {
                 &config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let sample_size = size_of::<i16>();
+                    // output silence on the first callback
                     let first = first.get_mut();
                     if *first {
                         *first = false;
@@ -184,6 +190,8 @@ impl AudioStreamRenderer {
 
                     buffer.read_exact(data_raw_slice).unwrap();
 
+                    // spread samples in place from the back so unread ones aren't overwritten
+
                     let total_sample_count = sample_count * replicate_sample_count;
                     if replicate_sample_count > 1 {
                         let mut write_pos = total_sample_count - replicate_sample_count;
@@ -199,6 +207,7 @@ impl AudioStreamRenderer {
                         }
                     }
 
+                    // underrun: pad with silence
                     data[total_sample_count..].fill(0);
                 },
                 move |err| {

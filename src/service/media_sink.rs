@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub(crate) type TimestampMicros = u64;
+/// Creates renderers for a media sink and describes their capabilities to the phone.
 pub(crate) trait StreamRendererFactory {
     type Renderer: StreamRenderer + Send;
     type Spec: Clone + Send;
@@ -18,6 +19,7 @@ pub(crate) trait StreamRendererFactory {
 
     fn create(&self, spec: &Self::Spec) -> Result<Self::Renderer, ()>;
 }
+/// Plays back media content received from the phone.
 pub(crate) trait StreamRenderer {
     fn start(&mut self);
 
@@ -37,6 +39,8 @@ pub(crate) trait StreamRenderer {
     }
 }
 
+/// Media sink service (video or audio output) implementing the setup/start/stop
+/// and content/ack flow control protocol on top of a `StreamRenderer`.
 pub(crate) struct MediaService<P: StreamRendererFactory + Send + Sync> {
     service_id: u8,
     spec: P::Spec,
@@ -82,6 +86,7 @@ impl<P: StreamRendererFactory + Send + Sync> MediaService<P> {
                         .as_mut()
                         .ok_or(())
                         .map_err(|_| warn!("Not setuped yet"))?;
+                    // timestamped content is prefixed with a u64 BE timestamp in microseconds
                     let (content, timestamp) = if message_id == Self::MESSAGE_ID_TIMESTAMPED_CONTENT
                     {
                         let timestamp_micros = BigEndian::read_u64(packet.payload());
@@ -92,6 +97,7 @@ impl<P: StreamRendererFactory + Send + Sync> MediaService<P> {
                         (packet.payload(), None)
                     };
                     renderer.add_content(content, timestamp).await;
+                    // ack before the phone reaches its limit of unacked messages and stalls
                     if unacked_content_messages.len() >= Self::MAX_UNACKED_CONTENT_MESSAGES - 1 {
                         packet_sender
                             .send_proto(

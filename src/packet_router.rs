@@ -27,12 +27,14 @@ use crate::{
     usb::{self, UsbManager},
 };
 
+/// Connection setup: version exchange -> TLS handshake -> established.
 enum PacketRouterConnectionState {
     WaitVersionResponse,
     Handshaking,
     Established { heartbeat: Heartbeater },
 }
 
+/// Why `handle_connection` returned; decides whether to wait for a reconnect or exit.
 #[derive(Clone, Copy)]
 enum PacketRouterTeardownReason {
     ClosingRouter,
@@ -42,11 +44,15 @@ enum PacketRouterTeardownReason {
     ConnectionPingTimeout,
 }
 
+/// Drives the protocol for one USB connection: handles the control channel and
+/// forwards packets between opened channels and their services.
 pub(crate) struct PacketRouter<'a> {
     services: &'a [Box<dyn Service>],
+    /// channel id -> (service id, queue into the service)
     channel_mapping: HashMap<u8, (i32, Sender<Packet>)>,
     usb_manager: &'a mut UsbManager,
     framer: PacketFramer,
+    /// Cloned into every service so they can send packets to the phone.
     outgoing_packet_queue_sender: Sender<Packet>,
     connection_state: PacketRouterConnectionState,
 }
@@ -56,6 +62,7 @@ enum HeartbeatState {
     WaitingForPingResponse,
 }
 
+/// Sends periodic ping requests and detects missing ping responses.
 struct Heartbeater {
     state: HeartbeatState,
     counter: u32,
@@ -74,6 +81,7 @@ impl Heartbeater {
         }
     }
 
+    /// Returns the next ping request to send, or an error if the previous ping timed out.
     fn handle_timer_elapsed(&mut self) -> Result<Packet, ()> {
         match self.state {
             HeartbeatState::WaitingUntilSendingNextPingRequest => {
@@ -91,6 +99,7 @@ impl Heartbeater {
         }
     }
 
+    /// Postpones the next ping; called for every incoming packet since any traffic proves liveness.
     fn restart_ping_countdown_timer(&mut self) {
         match self.state {
             HeartbeatState::WaitingUntilSendingNextPingRequest => {
@@ -125,6 +134,7 @@ impl Heartbeater {
 }
 
 impl<'a> PacketRouter<'a> {
+    /// Handles phone connections one after another until `cancel_token` is cancelled.
     pub(crate) async fn start(
         mut usb_manager: UsbManager,
         cancel_token: CancellationToken,
@@ -156,7 +166,7 @@ impl<'a> PacketRouter<'a> {
                     (cancel_reason, outgoing_packet_queue_receiver)
                 };
 
-                //Wait until all services terminated
+                // Wait until all services terminated (they hold the last senders)
                 while outgoing_packet_queue_receiver.recv().await.is_some() {}
 
                 if matches!(
@@ -176,6 +186,7 @@ impl<'a> PacketRouter<'a> {
         }
     }
 
+    /// Runs the protocol on the current connection until it is torn down.
     async fn handle_connection(
         &mut self,
         outgoing_packet_queue: &mut Receiver<Packet>,
@@ -325,6 +336,7 @@ impl<'a> PacketRouter<'a> {
         Ok(())
     }
 
+    /// Routes an established-state packet. Returns `true` if the phone requested shutdown.
     async fn decode_packet(&mut self, packet: Packet) -> Result<bool, ()> {
         if matches!(packet.r#type, AAPFrameType::Control)
             && packet.message_id() == MESSAGE_ID_OPEN_CHANNEL_REQUEST
@@ -350,6 +362,7 @@ impl<'a> PacketRouter<'a> {
         let _ = self.send_packet(build_shutdown_request()).await;
     }
 
+    /// Binds the requested channel to its service and starts the service on it.
     async fn handle_open_channel_request(&mut self, packet: Packet) -> Result<(), ()> {
         let open_channel_request = protos::ChannelOpenRequest::decode(packet.payload())
             .map_err(|_| error!("couldn't decode channel open request"))?;
@@ -408,6 +421,7 @@ impl<'a> PacketRouter<'a> {
         Ok(())
     }
 
+    /// Handles control channel messages. Returns `true` if the phone requested shutdown.
     async fn handle_control_packet(&mut self, packet: Packet) -> Result<bool, ()> {
         match packet.message_id() {
             MESSAGE_ID_SERVICE_DISCOVERY_REQUEST => {
@@ -489,6 +503,8 @@ impl<'a> PacketRouter<'a> {
     }
 }
 
+/// Non-owning variant of `ChannelPacketSender` for use from non-async
+/// callbacks (audio/input threads); does not keep the connection alive.
 #[derive(Clone)]
 pub(crate) struct WeakChannelPacketSender {
     sender: WeakSender<Packet>,
@@ -496,6 +512,7 @@ pub(crate) struct WeakChannelPacketSender {
 }
 
 impl WeakChannelPacketSender {
+    /// Sends an encrypted proto message. Returns `Ok(None)` if the connection is already gone.
     pub(crate) fn blocking_send_proto(
         &self,
         message_id: u16,
@@ -516,6 +533,7 @@ impl WeakChannelPacketSender {
             .transpose()
     }
 
+    /// Sends an encrypted raw message. Returns `Ok(None)` if the connection is already gone.
     pub(crate) fn blocking_send_raw(
         &self,
         message_id: u16,
@@ -537,6 +555,7 @@ impl WeakChannelPacketSender {
     }
 }
 
+/// Lets a service send packets on the channel it was opened on.
 pub(crate) struct ChannelPacketSender {
     sender: Sender<Packet>,
     channel_id: u8,

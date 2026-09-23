@@ -9,6 +9,8 @@ pub(crate) mod audio_source;
 
 mod gst_input_event_tap;
 
+/// A service advertised to the phone during service discovery. Once the phone
+/// opens a channel for it, `instanciate` is called to handle that channel.
 pub(crate) trait Service {
     fn get_id(&self) -> i32 {
         self.get_descriptor().id
@@ -16,6 +18,8 @@ pub(crate) trait Service {
 
     fn get_descriptor(&self) -> protos::Service;
 
+    /// Starts handling a newly opened channel. Implementations typically spawn a
+    /// task that runs until `packet_receiver` is closed.
     fn instanciate(
         &self,
         packet_sender: ChannelPacketSender,

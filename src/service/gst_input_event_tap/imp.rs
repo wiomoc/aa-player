@@ -15,6 +15,8 @@ use gstreamer::subclass::prelude::GstObjectImpl;
 use log::info;
 
 
+/// Pass-through GStreamer element that intercepts upstream navigation events
+/// (mouse/keyboard from the video sink) and emits them as `input-event` signal.
 pub struct InputEventTap {
     srcpad: gstreamer::Pad,
     sinkpad: gstreamer::Pad,
@@ -38,6 +40,7 @@ impl InputEventTap {
         self.srcpad.peer_query(query)
     }
 
+    /// Navigation events are consumed and emitted as signal, all others passed upstream.
     fn src_event(&self, _pad: &gstreamer::Pad, event: gstreamer::Event) -> bool {
         if let Some(structure) = event.structure()
             && structure.name().as_str() == "application/x-gst-navigation"
