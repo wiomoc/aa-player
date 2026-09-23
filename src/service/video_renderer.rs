@@ -132,35 +132,47 @@ impl VideoStreamRenderer {
             None
         });
 
-        let d3d11h264dec = gstreamer::ElementFactory::make("d3d11h264dec")
+        let (decoder, sink) = make_decoder_and_sink();
+
+        let mut elements = vec![appsrc.upcast_ref(), event_interceptor.upcast_ref(), &decoder];
+        #[cfg(not(windows))]
+        let videoconvert = gstreamer::ElementFactory::make("videoconvert")
             .build()
             .unwrap();
-        let d3dvideosink = gstreamer::ElementFactory::make("d3d11videosink")
-            .build()
-            .unwrap();
+        #[cfg(not(windows))]
+        elements.push(&videoconvert);
+        elements.push(&sink);
 
-        pipeline
-            .add_many([
-                appsrc.upcast_ref(),
-                event_interceptor.upcast_ref(),
-                &d3d11h264dec,
-                &d3dvideosink,
-            ])
-            .unwrap();
+        pipeline.add_many(&elements).unwrap();
+        gstreamer::Element::link_many(&elements).unwrap();
 
-        gstreamer::Element::link_many([
-            appsrc.upcast_ref(),
-            event_interceptor.upcast_ref(),
-            &d3d11h264dec,
-            &d3dvideosink,
-        ])
-        .unwrap();
         Self {
             pipeline,
             appsrc,
             cancel_token_on_close_clicked: spec.cancel_token_on_close_clicked.clone()
         }
     }
+}
+
+#[cfg(windows)]
+fn make_decoder_and_sink() -> (gstreamer::Element, gstreamer::Element) {
+    (make_first_available(&["d3d11h264dec"]), make_first_available(&["d3d11videosink"]))
+}
+
+#[cfg(not(windows))]
+fn make_decoder_and_sink() -> (gstreamer::Element, gstreamer::Element) {
+    (
+        // VA-API hardware decoding, software fallback via gst-libav
+        make_first_available(&["vah264dec", "avdec_h264"]),
+        make_first_available(&["autovideosink"]),
+    )
+}
+
+fn make_first_available(factories: &[&str]) -> gstreamer::Element {
+    factories
+        .iter()
+        .find_map(|name| gstreamer::ElementFactory::make(name).build().ok())
+        .unwrap_or_else(|| panic!("none of the gstreamer elements {factories:?} is available"))
 }
 
 impl StreamRenderer for VideoStreamRenderer {
